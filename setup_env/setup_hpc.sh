@@ -7,4 +7,5 @@ conda create -y -n "$CONDA_ENV" python=3.10
 eval "$(conda shell.bash hook)"; conda activate "$CONDA_ENV"
 pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
 pip install -r "$PROJECT_ROOT/rtdetrv2_pytorch/requirements.txt"
+pip install "numpy<2"   # torch 2.1.2 no es compatible con NumPy 2
 python -c "import torch;print(torch.__version__, torch.version.cuda)"
