@@ -1,0 +1,21 @@
+# Detector de personas (1 clase) basado en rtdetrv2_r50vd_6x_coco.
+# Las rutas de datos, checkpoint y salida NO van aquí: las inyecta tracking/scripts/train_detector.sh con -u desde las variables de entorno.
+__include__: ['../../rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_6x_coco.yml']
+
+num_classes: 1
+remap_mscoco_category: False   # category_id del COCO convertido = 0 = label 0
+
+epoches: 24                    # ajustable con EPOCHS; no validado, es un punto de partida
+sync_bn: True                  # el script lo pone a False con 1 GPU
+
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: 21              # últimas 3 épocas sin aumentos fuertes (equivale a 71/72 del config original)
+  collate_fn:
+    stop_epoch: 21
+  total_batch_size: 16
+
+val_dataloader:
+  total_batch_size: 32
