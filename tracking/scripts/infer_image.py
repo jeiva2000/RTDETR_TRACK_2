@@ -7,7 +7,7 @@ from src.core import YAMLConfig
 
 
 def default_image():
-    root = os.environ.get('DANCETRACK_DIR') or os.path.join(os.environ.get('DATA_ROOT', '.'), 'dancetrack')
+    root = os.environ.get('DANCETRACK_DIR') or os.path.join(os.environ.get('DATA_ROOT', '.'), 'DanceTrack')
     fs = sorted(glob.glob(os.path.join(root, 'val', '*', 'img1', '*.jpg')))
     if not fs:
         sys.exit(f'No hay imágenes en {root}/val; define DANCETRACK_DIR o pasa --image')

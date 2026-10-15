@@ -2,10 +2,10 @@
 # Descarga DanceTrack (train1, train2, val) desde Hugging Face, un archivo por llamada
 # (el --include con varios archivos omitió train1.zip), verifica y extrae.
 # Uso: bash setup_env/download_dancetrack.sh [local|hpc]
-# Destino: $DANCETRACK_DIR si está definido; si no, $DATA_ROOT/dancetrack
+# Destino: $DANCETRACK_DIR si está definido; si no, $DATA_ROOT/DanceTrack
 set -euo pipefail
 source "$(dirname "$0")/load.sh" "${1:-local}"
-DEST="${DANCETRACK_DIR:-$DATA_ROOT/dancetrack}"
+DEST="${DANCETRACK_DIR:-$DATA_ROOT/DanceTrack}"
 mkdir -p "$DEST"; cd "$DEST"
 python -m pip install -q -U huggingface_hub
 for z in train1 train2 val; do
