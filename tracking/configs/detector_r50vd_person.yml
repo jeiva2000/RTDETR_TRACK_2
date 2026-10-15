@@ -6,6 +6,13 @@ num_classes: 1
 remap_mscoco_category: False   # category_id del COCO convertido = 0 = label 0
 
 epoches: 24                    # ajustable con EPOCHS; no validado, es un punto de partida
+checkpoint_freq: 4             # checkpointNNNN.pth cada 4 épocas (además de last.pth y best.pth); no validado
+
+early_stopping:                # solver con early stopping sobre el AP de val (tracking/detector/solver_es.py)
+  patience: 5
+  min_delta: 0.001
+  min_epochs: 6
+
 sync_bn: True                  # el script lo pone a False con 1 GPU
 
 train_dataloader:
