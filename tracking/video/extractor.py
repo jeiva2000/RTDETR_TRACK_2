@@ -15,6 +15,36 @@ from src.zoo.rtdetr.box_ops import box_cxcywh_to_xyxy, box_iou
 DEFAULT_CONFIG = os.path.join(ROOT, 'tracking', 'configs', 'detector_r50vd_person.yml')
 
 
+def topk_queries(logits, boxes, emb, k):
+    """Top-K queries por score (selección sin gradiente; el embedding conserva el suyo).
+    logits (B,Q,C) boxes (B,Q,4) emb (B,Q,D) -> dict(emb, boxes, logits, scores, query_idx) con (B,K,...)."""
+    scores = logits.detach().sigmoid().max(-1).values
+    k = min(k, scores.shape[1])
+    sc, idx = scores.topk(k, dim=1)
+    g = lambda t: t.gather(1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+    return dict(emb=g(emb), boxes=g(boxes), logits=g(logits), scores=sc, query_idx=idx)
+
+
+@torch.no_grad()
+def match_queries(matcher, q, gts, device, min_iou=0.0):
+    """Asigna track ID a cada query con el Hungarian del detector (ver QueryExtractor.match)."""
+    B, K = q['scores'].shape
+    tid = torch.full((B, K), -1, dtype=torch.long)
+    miou = torch.zeros(B, K)
+    targets = [dict(labels=torch.zeros(len(g), dtype=torch.long, device=device), boxes=g[:, 1:5].to(device).float()) for g in gts]
+    nonempty = [i for i, g in enumerate(gts) if len(g)]
+    if not nonempty:
+        return tid, miou
+    sub = dict(pred_logits=q['logits'][nonempty].detach().float(), pred_boxes=q['boxes'][nonempty].detach().float())
+    idx = matcher(sub, [targets[i] for i in nonempty])['indices']
+    for b, (src, tgt) in zip(nonempty, idx):
+        ious = box_iou(box_cxcywh_to_xyxy(q['boxes'][b, src].detach().float()), box_cxcywh_to_xyxy(targets[b]['boxes'][tgt]))[0].diag().cpu()
+        keep = ious >= min_iou
+        tid[b, src[keep]] = gts[b][tgt[keep], 0].long()
+        miou[b, src[keep]] = ious[keep]
+    return tid, miou
+
+
 class QueryExtractor:
     """Detector congelado -> por frame, top-K queries: embedding (256), caja (cxcywh normalizada) y score."""
 
@@ -38,31 +68,10 @@ class QueryExtractor:
         out = self.model(images.to(self.device))
         logits, boxes, emb = out['pred_logits'], out['pred_boxes'], self._emb
         assert emb is not None and emb.shape[:2] == logits.shape[:2], 'el hook no capturó la salida del decoder'
-        scores = logits.sigmoid().max(-1).values
-        k = min(self.top_k, scores.shape[1])
-        sc, idx = scores.topk(k, dim=1)
-        g = lambda t: t.gather(1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
-        return dict(emb=g(emb), boxes=g(boxes), logits=g(logits), scores=sc, query_idx=idx)
+        return topk_queries(logits, boxes, emb, self.top_k)
 
-    @torch.no_grad()
     def match(self, q, gts, min_iou=0.0):
-        """Asigna track ID a cada query con el Hungarian del detector.
+        """Asigna track ID a cada query con el Hungarian del detector (la caché y la inferencia usan esto).
         q: salida de __call__; gts: lista (B) de tensores (N,5) = [track_id, cx, cy, w, h] normalizados.
-        Devuelve track_id (B,K) con -1 = fondo, y match_iou (B,K) (IoU de la query con su GT; 0 si es fondo).
-        min_iou > 0 descarta emparejamientos con IoU menor (por defecto 0 = Hungarian puro, como en el plan)."""
-        B, K = q['scores'].shape
-        tid = torch.full((B, K), -1, dtype=torch.long)
-        miou = torch.zeros(B, K)
-        targets = [dict(labels=torch.zeros(len(g), dtype=torch.long, device=self.device),
-                        boxes=g[:, 1:5].to(self.device).float()) for g in gts]
-        nonempty = [i for i, g in enumerate(gts) if len(g)]
-        if not nonempty:
-            return tid, miou
-        sub = dict(pred_logits=q['logits'][nonempty], pred_boxes=q['boxes'][nonempty])
-        idx = self.matcher(sub, [targets[i] for i in nonempty])['indices']
-        for b, (src, tgt) in zip(nonempty, idx):
-            ious = box_iou(box_cxcywh_to_xyxy(q['boxes'][b, src]), box_cxcywh_to_xyxy(targets[b]['boxes'][tgt]))[0].diag().cpu()
-            keep = ious >= min_iou
-            tid[b, src[keep]] = gts[b][tgt[keep], 0].long()
-            miou[b, src[keep]] = ious[keep]
-        return tid, miou
+        Devuelve track_id (B,K) con -1 = fondo, y match_iou (B,K). min_iou > 0 descarta emparejamientos con IoU menor."""
+        return match_queries(self.matcher, q, gts, self.device, min_iou)

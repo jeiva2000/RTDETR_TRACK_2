@@ -109,21 +109,31 @@ class CachedClipDataset(_ClipBase):
 
 
 class ImageClipDataset(_ClipBase):
-    """Cada item: images (T,3,640,640), gts (lista T de (N,5)), frames, seq. La extracción se hace en el bucle de entrenamiento."""
+    """Cada item: images (T,3,640,640), gts (lista T de (N,5)), frames, seq. La extracción se hace en el bucle de entrenamiento.
+    seq_root: carpeta con secuencias, o lista de carpetas (p. ej. train1 y train2). flip=True voltea el clip entero con prob. 0.5."""
 
-    def __init__(self, seq_root, seqs=None, T=10, samples_per_epoch=1000, max_stride=1, p_skip=0.0, max_skip=0, seed=0):
-        seqs = seqs or sorted(d for d in os.listdir(seq_root) if os.path.isfile(os.path.join(seq_root, d, 'seqinfo.ini')))
-        self.root = seq_root
-        self.info = {s: read_seqinfo(os.path.join(seq_root, s)) for s in seqs}
-        self.gt = {s: load_gt(os.path.join(seq_root, s), self.info[s]) for s in seqs}
+    def __init__(self, seq_root, seqs=None, T=10, samples_per_epoch=1000, max_stride=1, p_skip=0.0, max_skip=0, seed=0, flip=False):
+        roots = [seq_root] if isinstance(seq_root, str) else list(seq_root)
+        self.dirs = {}
+        for r in roots:
+            for d in sorted(os.listdir(r)):
+                if os.path.isfile(os.path.join(r, d, 'seqinfo.ini')) and (not seqs or d in seqs):
+                    self.dirs[d] = os.path.join(r, d)
+        seqs = sorted(self.dirs)
+        self.flip = flip
+        self.info = {s: read_seqinfo(self.dirs[s]) for s in seqs}
+        self.gt = {s: load_gt(self.dirs[s], self.info[s]) for s in seqs}
         super().__init__(seqs, {s: self.info[s]['length'] for s in seqs}, T, samples_per_epoch,
                          max_stride, p_skip, max_skip, seed)
 
     def __getitem__(self, i):
         s, fr = self._pick(i)
-        d = os.path.join(self.root, s)
-        return dict(images=torch.stack([load_frame(d, self.info[s], f) for f in fr]),
-                    gts=[self.gt[s].get(f, torch.zeros(0, 5)) for f in fr], frames=torch.tensor(fr), seq=s)
+        images = torch.stack([load_frame(self.dirs[s], self.info[s], f) for f in fr])
+        gts = [self.gt[s].get(f, torch.zeros(0, 5)) for f in fr]
+        if self.flip and random.Random(self.seed * 999983 + i).random() < 0.5:
+            images = images.flip(-1)
+            gts = [torch.cat([g[:, :1], 1 - g[:, 1:2], g[:, 2:]], 1) if len(g) else g for g in gts]
+        return dict(images=images, gts=gts, frames=torch.tensor(fr), seq=s)
 
 
 def collate_images(batch):
