@@ -26,7 +26,7 @@ from tracking.assoc.assign import hungarian_assign
 from tracking.assoc.core import Tracks, step
 
 
-def run_clip(model, c, a, device, train, ss):
+def run_clip(model, c, a, device, train, ss, log=None):
     E_all, D_all, sc_all = c['emb'].to(device), c['boxes'].to(device), c['scores'].to(device)
     tid, frames = c['track_id'].to(device), c['frames'].to(device)
     T, K = tid.shape
@@ -57,6 +57,7 @@ def run_clip(model, c, a, device, train, ss):
                 idx = torch.where(target < K, target, -1)
                 pr = torch.softmax(lg.detach(), 1)[torch.arange(len(idx)), target]
                 return idx, torch.where(idx >= 0, pr, torch.zeros_like(pr))
+            gap0 = (frames[t] - tr.last).cpu()  # frames desde que se vio cada track, antes de decidir
             logits, idx = step(model, tr, E_all[t], D_all[t], sc_all[t], frames[t],
                                (lambda lg: hungarian_assign(lg)) if use_model else gt_choice, valid)
             in_cross = torch.tensor([i in cross_ids[t] for i in tr.ids], device=device)
@@ -69,6 +70,11 @@ def run_clip(model, c, a, device, train, ss):
             pres = target < K
             n_ok_present += int(ok[pres].sum()); n_present += int(pres.sum())
             n_ok_cross += int(ok[in_cross].sum()); n_cross += int(in_cross.sum())
+            if log is not None:  # diagnóstico: una fila por decisión (tgt, pred, id GT de la detección elegida, cruce, gap)
+                pg = torch.where(idx >= 0, tid[t][idx.clamp(min=0)], torch.full_like(idx, -2)).cpu()
+                for i in range(len(target)):
+                    log.append(dict(tgt=int(target[i]) if target[i] < K else -1, pred=int(idx[i]), pred_gt=int(pg[i]),
+                                    own=int(tr.ids[i]), cross=bool(in_cross[i]), gap=int(gap0[i])))
             tr.keep(frames[t] - tr.last <= a.max_lost)
         known = set(tr.ids)
         new = [j for j, i in enumerate(tid[t].tolist()) if i >= 0 and valid[j] and i not in known]
