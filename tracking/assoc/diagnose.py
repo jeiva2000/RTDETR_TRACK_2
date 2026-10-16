@@ -44,13 +44,15 @@ def decisions(a):
     m = AssocModel(ar.update, in_dim=ck['model']['proj.0.weight'].shape[1], dim=ar.dim, hidden=ar.hidden, ema_alpha=ar.ema_alpha,
                    graph_radius=ar.graph_radius, app_aff=ar.app_aff).to(a.device).eval()
     m.load_state_dict(ck['model'])
-    ds = CachedClipDataset(a.cache, None, T=ar.T, samples_per_epoch=a.samples, seed=a.seed, max_stride=ar.max_stride, p_skip=ar.p_skip,
-                           max_skip=ar.max_skip, gt_root=a.gt_root or ar.gt_root, cross_iou=ar.cross_iou)
+    pick = lambda v, d: d if v is None else v  # el régimen de clips se puede fijar para comparar modelos entrenados con otro
+    T, ms, ps, mk = pick(a.T, ar.T), pick(a.max_stride, ar.max_stride), pick(a.p_skip, ar.p_skip), pick(a.max_skip, ar.max_skip)
+    ds = CachedClipDataset(a.cache, None, T=T, samples_per_epoch=a.samples, seed=a.seed, max_stride=ms, p_skip=ps,
+                           max_skip=mk, gt_root=a.gt_root or ar.gt_root, cross_iou=ar.cross_iou)
     log = []
     with torch.no_grad():
         for i in range(len(ds)):
             run_clip(m, ds[i], ar, a.device, train=False, ss=1.0, log=log)
-    print(f'variante={ar.update}  clips={len(ds)}  decisiones={len(log)}  (cruce = par GT con IoU>{ar.cross_iou})')
+    print(f'variante={ar.update}  régimen de clips: T={T} max_stride={ms} p_skip={ps} max_skip={mk}  clips={len(ds)}  decisiones={len(log)}  (cruce = par GT con IoU>{ar.cross_iou})')
     table(log, 'TODAS')
     table([r for r in log if r['cross']], 'en cruce')
     table([r for r in log if not r['cross']], 'fuera de cruce')
@@ -86,6 +88,8 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('decisions'); d.add_argument('--ckpt', required=True); d.add_argument('--cache', required=True)
     d.add_argument('--samples', type=int, default=1000); d.add_argument('--seed', type=int, default=777)
+    d.add_argument('--T', type=int, default=None); d.add_argument('--max-stride', type=int, default=None)
+    d.add_argument('--p-skip', type=float, default=None); d.add_argument('--max-skip', type=int, default=None)
     d.add_argument('--gt-root', default=None); d.add_argument('--device', default=None, help='por defecto cuda:0 si hay GPU, si no cpu')
     q = sub.add_parser('per-seq'); q.add_argument('--gt-root', default=os.environ.get('DANCETRACK_DIR', '') and os.path.join(os.environ.get('DANCETRACK_DIR', ''), 'val'))
     q.add_argument('--methods', nargs='+', required=True, help='nombre=carpeta_con_<seq>.txt'); q.add_argument('--seqs', nargs='*', default=None)
