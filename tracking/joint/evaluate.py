@@ -37,12 +37,15 @@ class _Frames(torch.utils.data.Dataset):
 
 
 @torch.no_grad()
-def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=4, device='cuda:0'):
-    """DetA (TrackEval) de las detecciones con score >= thr en los frames (f-1) % stride == 0. fwd(images) -> logits, boxes (cxcywh norm)."""
+def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=4, device='cuda:0', extra_thrs=()):
+    """DetA (TrackEval) de las detecciones con score >= thr en los frames (f-1) % stride == 0. fwd(images) -> logits, boxes (cxcywh norm).
+    Devuelve DetA (a thr), n_det y, si se piden extra_thrs, DetA_by_thr {umbral: DetA} (útil para separar un cambio de calibración
+    de scores de un empeoramiento real)."""
     from tracking.baseline.evaluate import trackeval_run
-    gt_dir, det_dir = os.path.join(work_dir, 'strided_gt'), os.path.join(work_dir, 'strided_dets')
+    thrs = [thr] + [t for t in extra_thrs if t != thr]
+    gt_dir = os.path.join(work_dir, 'strided_gt')
     lengths = make_strided_gt(val_root, seqs, stride, gt_dir)
-    n_det = 0
+    n_det = {t: 0 for t in thrs}
     for s in seqs:
         info = read_seqinfo(os.path.join(val_root, s))
         frames = list(range(1, info['length'] + 1, stride))
@@ -52,15 +55,23 @@ def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=
             logits, boxes = fwd(x.to(device))
             sc = logits.float().sigmoid().max(-1).values.cpu(); bx = boxes.float().cpu()
             for b in range(len(ix)):
-                for j in (sc[b] >= thr).nonzero().flatten().tolist():
+                for j in (sc[b] >= min(thrs)).nonzero().flatten().tolist():
                     cx, cy, w, h = bx[b, j].tolist()
                     rows.append((int(ix[b]) + 1, len(rows) + 1, (cx - w / 2) * info['width'], (cy - h / 2) * info['height'],
                                  w * info['width'], h * info['height'], float(sc[b, j])))
-        n_det += len(rows)
-        write_mot(os.path.join(det_dir, f'{s}.txt'), rows)
-    with contextlib.redirect_stdout(io.StringIO()):
-        r = trackeval_run(gt_dir, det_dir, lengths)
-    return dict(DetA=r['DetA'], n_det=n_det)
+        for t in thrs:
+            sel = [r for r in rows if r[6] >= t]
+            n_det[t] += len(sel)
+            write_mot(os.path.join(work_dir, f'strided_dets_{t}', f'{s}.txt'), sel)
+    by_thr = {}
+    for t in thrs:
+        with contextlib.redirect_stdout(io.StringIO()):
+            by_thr[t] = trackeval_run(gt_dir, os.path.join(work_dir, f'strided_dets_{t}'), lengths)['DetA']
+    out = dict(DetA=by_thr[thr], n_det=n_det[thr])
+    if extra_thrs:
+        out['DetA_by_thr'] = {str(t): by_thr[t] for t in thrs}
+        out['n_det_by_thr'] = {str(t): n_det[t] for t in thrs}
+    return out
 
 
 @torch.no_grad()

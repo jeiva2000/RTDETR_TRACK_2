@@ -108,11 +108,12 @@ def main(a):
         return out['pred_logits'], out['pred_boxes'], det.holder['emb']
 
     with torch.no_grad():
-        d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev, num_workers=a.num_workers)
+        d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev, num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs)
         v0 = eval_assoc_live(extract_eval, matcher, assoc, val_ds, ar, dev, a.top_k, a.min_iou)
     det.set_train(True)
     deta0 = d0['DetA']
-    print(f'inicial: DetA={deta0:.2f} (thr {a.deta_thr}, stride {a.deta_stride}, {d0["n_det"]} detecciones)  val_acc(asignación)={v0["acc"]:.4f}', flush=True)
+    print(f'inicial: DetA={deta0:.2f} (thr {a.deta_thr}, stride {a.deta_stride}, {d0["n_det"]} detecciones)  val_acc(asignación)={v0["acc"]:.4f}'
+          + (f'  DetA por umbral={ {k: round(x, 2) for k, x in d0["DetA_by_thr"].items()} }' if 'DetA_by_thr' in d0 else ''), flush=True)
     best_acc, step, t_start = -1.0, 0, time.time()
     log_path = os.path.join(a.out, 'log.txt')
     stop_reason = None
@@ -161,12 +162,12 @@ def main(a):
                       f'{(time.time() - t0) / run["n"]:.2f}s/it', flush=True)
 
         with torch.no_grad():
-            d = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev, num_workers=a.num_workers)
+            d = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev, num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs)
             v = eval_assoc_live(extract_eval, matcher, assoc, val_ds, ar, dev, a.top_k, a.min_iou)
         det.set_train(True)
         ok_deta = d['DetA'] >= deta0 - a.deta_tol
         rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_assoc=run['assoc'] / max(run['n'], 1), DetA=d['DetA'], DetA_init=deta0,
-                   n_det=d['n_det'], val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], deta_ok=bool(ok_deta), time=time.time() - t0)
+                   n_det=d['n_det'], DetA_by_thr=d.get('DetA_by_thr'), n_det_by_thr=d.get('n_det_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], deta_ok=bool(ok_deta), time=time.time() - t0)
         print(json.dumps(rec), flush=True)
         with open(log_path, 'a') as fh:
             fh.write(json.dumps(rec) + '\n')
@@ -210,6 +211,7 @@ if __name__ == '__main__':
     p.add_argument('--no-flip', action='store_true')
     p.add_argument('--deta-thr', type=float, default=0.6); p.add_argument('--deta-stride', type=int, default=2)
     p.add_argument('--deta-tol', type=float, default=0.5, help='puntos de DetA por debajo del inicial que se toleran antes de parar')
+    p.add_argument('--deta-extra-thrs', type=float, nargs='*', default=[0.5, 0.7], help='umbrales adicionales cuyo DetA solo se registra (no controla la parada)')
     p.add_argument('--eval-seqs', nargs='*', default=None); p.add_argument('--val-clips', type=int, default=100)
     p.add_argument('--num-workers', type=int, default=8); p.add_argument('--print-freq', type=int, default=20)
     p.add_argument('--seed', type=int, default=int(os.environ.get('SEED', 42)))
