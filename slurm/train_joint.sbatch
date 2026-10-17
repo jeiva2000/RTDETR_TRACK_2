@@ -7,7 +7,11 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 # Fase 7: fine-tuning conjunto (solo decoder + módulo de asociación). UNA GPU. Añadir --partition / --account según el clúster.
-# Desde la raíz del repo (con mkdir -p logs hecho), con la variante nueva (hist) como inicialización del módulo:
+# Desde la raíz del repo (con mkdir -p logs hecho). DOS MODOS según ASSOC_CKPT:
+#  a) módulo DESDE CERO junto al decoder, partiendo solo del detector (sin ASSOC_CKPT):
+#   DET_CKPT=/ruta/detector/best.pth RUN_NAME=joint_hist_scratch \
+#     EXTRA="--update hist --burn-in 10 --clips-per-step 4 --samples-per-epoch 1000 --epochs 40 --deta-stride 4" sbatch slurm/train_joint.sbatch
+#  b) módulo inicializado desde un checkpoint de la Fase 6:
 #   DET_CKPT=/ruta/detector/best.pth ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth RUN_NAME=joint_hist \
 #     EXTRA="--samples-per-epoch 400 --epochs 15" sbatch slurm/train_joint.sbatch
 # (sbatch hereda el entorno; también valen argumentos tras el nombre del script.) Semilla: la de paths.hpc.env salvo --seed en EXTRA.

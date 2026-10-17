@@ -9,8 +9,8 @@
 #SBATCH --error=logs/%x_%A_%a.err
 # Fase 7: barrido del peso de la pérdida de asociación. La prueba anterior (λ=10, 1 época) empeoró DetA y tracking y la causa no está
 # aislada; λ=0 es el control (¿degrada el detector solo por el régimen de ajuste?). Desde la raíz del repo:
-#   DET_CKPT=... ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth BASE=joint_hist EXTRA="--samples-per-epoch 400 --epochs 15" \
-#     sbatch slurm/joint_lambda_sweep.sbatch
+#   DET_CKPT=... BASE=joint_hist EXTRA="--update hist --burn-in 10 --clips-per-step 4 --samples-per-epoch 1000 --epochs 40 --deta-stride 4" \
+#     sbatch slurm/joint_lambda_sweep.sbatch                  # módulo desde cero; añade ASSOC_CKPT=... para partir de un checkpoint de la Fase 6
 # Cada tarea escribe en $OUTPUT_ROOT/<BASE>_l<λ>/ (detector_best/last.pth, assoc_best/last.pth, log.txt, train.log).
 set -euo pipefail
 module load GCC/12.2.0 CUDA/11.8.0

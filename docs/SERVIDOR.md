@@ -78,28 +78,41 @@ quedan congelados. Pérdida = detección completa de RT-DETRv2 (con denoising) s
 (asociación + visibilidad), con gradiente hacia el decoder a través de los embeddings. Los primeros `burn-in` frames de cada clip se
 extraen en modo eval y sin gradiente (llenan estado e historial; no entran en la pérdida de detección). `lr`: decoder 2e-5, módulo 1e-3.
 
-## Requisitos
-1. El detector (`best.pth`) y un módulo `hist` ya entrenado en la Fase 6 (p. ej. `assoc_hist_A_s1/best.pth`), que se usa como inicialización.
-2. `DANCETRACK_DIR` con `train1/ train2/ val/` (el entrenamiento lee imágenes y GT directamente).
-3. Una GPU grande (A100). **Memoria sin medir:** con 2 clips por paso son 2 × T frames con gradiente por el decoder; si falta, baja `--clips-per-step` o `--T`.
+## Dos modos de inicialización del módulo
+- **Desde cero (sin `ASSOC_CKPT`):** el módulo se crea con los argumentos de la línea de comandos (`--update hist`, `--hist-aff max`, `--burn-in 10`, ...) y se
+  entrena junto al decoder, partiendo **solo del checkpoint del detector**. Por defecto, los primeros **1000 pasos solo aprende el módulo** (decoder a `lr` 0,
+  `--det-freeze-steps`) y el scheduled sampling sube de 0 a 0.5 en 3 épocas (`--ss-warmup`), para que un módulo aleatorio no empuje al decoder con gradientes sin sentido.
+  Esos valores son una elección mía, sin validar.
+- **Desde un checkpoint de la Fase 6 (`ASSOC_CKPT=...`):** el módulo hereda configuración y pesos; sin periodo de solo-módulo.
 
-## Lanzar (un entrenamiento)
+## Requisitos
+1. El detector (`best.pth`) en el servidor. Para el modo (b), además un módulo ya entrenado en la Fase 6 (p. ej. `assoc_hist_A_s1/best.pth`).
+2. `DANCETRACK_DIR` con `train1/ train2/ val/` (el entrenamiento lee imágenes y GT directamente).
+3. Una GPU grande (A100). **Memoria sin medir:** con 4 clips por paso son 4 × T frames con gradiente por el decoder; si falta, baja `--clips-per-step` o `--T`.
+
+## Lanzar (un entrenamiento, módulo desde cero)
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull && mkdir -p logs
-DET_CKPT=/ruta/detector/best.pth ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth RUN_NAME=joint_hist \
-  EXTRA="--samples-per-epoch 400 --epochs 15" sbatch slurm/train_joint.sbatch
+DET_CKPT=/ruta/detector/best.pth RUN_NAME=joint_hist_scratch \
+  EXTRA="--update hist --burn-in 10 --clips-per-step 4 --samples-per-epoch 1000 --epochs 40 --deta-stride 4" sbatch slurm/train_joint.sbatch
 ```
-`--samples-per-epoch 400` hace épocas cortas (200 pasos) para vigilar el DetA con frecuencia: en la prueba anterior la caída apareció en la
-primera época de 500 pasos. Los demás valores por defecto son: `λ_assoc` = 10, `--lr-det 2e-5`, tolerancia de DetA 0.5 puntos (umbral 0.6, stride 2).
+(La variante B de afinidad: añade `--hist-aff max` a `EXTRA`.) Con 4 clips por paso, 1000 clips por época son 250 pasos; 40 épocas son 40 000 clips, el mismo orden que la
+Fase 6 (2000 × 20). `--deta-stride 4` acelera el control de DetA de cada época (menos frames); el DetA inicial se mide con el mismo stride.
+Con checkpoint de la Fase 6: `ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth` y `EXTRA="--samples-per-epoch 400 --epochs 15"`.
+Los valores por defecto: `λ_assoc` = 10, `--lr-det 2e-5`, tolerancia de DetA 0.5 puntos (umbral 0.6).
 
 ## Recomendado: barrido de λ (4 entrenamientos en paralelo, una GPU cada uno)
 ```bash
-DET_CKPT=/ruta/detector/best.pth ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth BASE=joint_hist \
-  EXTRA="--samples-per-epoch 400 --epochs 15" sbatch slurm/joint_lambda_sweep.sbatch
+DET_CKPT=/ruta/detector/best.pth BASE=joint_hist_scratch \
+  EXTRA="--update hist --burn-in 10 --clips-per-step 4 --samples-per-epoch 1000 --epochs 40 --deta-stride 4" sbatch slurm/joint_lambda_sweep.sbatch
 ```
-Lanza `λ` = 0, 1, 3 y 10. **`λ` = 0 es el control:** si el DetA baja igualmente, la causa es el régimen de ajuste y no la asociación.
-Resultados en `$OUTPUT_ROOT/joint_hist_l<λ>/`. Mira `log.txt` (una línea JSON por época: `DetA`, `DetA_by_thr`, `val_acc`, `val_vis_acc`)
-y la línea final de `train.log`.
+Lanza `λ` = 0, 1, 3 y 10. **`λ` = 0 es el control:** si el DetA baja igualmente, la causa no es la asociación. Resultados en `$OUTPUT_ROOT/<BASE>_l<λ>/`.
+Mira `log.txt` (una línea JSON por época: `DetA`, `DetA_by_thr`, `val_acc`, `val_vis_acc`) y la línea final de `train.log`.
+
+## Corrección importante respecto a la primera prueba de la Fase 7
+Las capas BatchNorm del decoder (`input_proj`) se actualizaban en cada paso con lotes de frames de un mismo clip (muy correlacionados) y usaban estadísticas
+del lote en lugar de las guardadas. Ahora quedan **siempre en modo eval** durante el ajuste (comprobado: con el decoder congelado el detector queda idéntico bit a bit).
+Es una explicación plausible, **no demostrada**, de la caída de DetA de la primera prueba; el control con `λ` = 0 lo dirá.
 
 ## Control de parada
 Si el DetA (umbral 0.6) cae más de 0.5 puntos por debajo del inicial, el entrenamiento **informa y se detiene**. `*_best.pth` es la mejor

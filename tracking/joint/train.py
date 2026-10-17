@@ -44,6 +44,11 @@ class Detector:
     def set_train(self, train):
         self.model.eval()
         self.dec.train(train)
+        # BatchNorm del decoder (input_proj) siempre en eval: con lotes de frames de un mismo clip (muy correlacionados) las estadísticas
+        # del lote no son las de la población, y actualizar las running_* desplaza el detector respecto a como se evalúa.
+        for m in self.dec.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                m.eval()
 
     def autocast(self):
         dt = {'fp16': torch.float16, 'bf16': torch.bfloat16}.get(self.amp)
@@ -70,16 +75,30 @@ def main(a):
     os.makedirs(a.out, exist_ok=True)
     cfg = YAMLConfig(a.config, PResNet=dict(pretrained=False))
     det = Detector(cfg, a.det_ckpt, dev, a.amp)
-    ack = torch.load(a.assoc_ckpt, map_location='cpu'); ar = argparse.Namespace(**ack['args'])
-    assoc = AssocModel.from_args(ar, ack['model']['proj.0.weight'].shape[1]).to(dev)
-    assoc.load_state_dict(ack['model']); assoc.train()
+    if a.assoc_ckpt:   # módulo preentrenado (Fase 6): configuración y pesos del checkpoint
+        ack = torch.load(a.assoc_ckpt, map_location='cpu'); ar = argparse.Namespace(**ack['args'])
+        assoc = AssocModel.from_args(ar, ack['model']['proj.0.weight'].shape[1]).to(dev)
+        assoc.load_state_dict(ack['model'])
+        print(f'módulo de asociación: inicializado desde {a.assoc_ckpt}', flush=True)
+    else:              # módulo desde cero: configuración de la línea de comandos, pesos aleatorios
+        ar = argparse.Namespace(update=a.update, dim=a.dim, hidden=a.hidden, ema_alpha=a.ema_alpha, graph_radius=a.graph_radius,
+                                app_aff=a.app_aff, hist_len=a.hist_len, hist_aff=a.hist_aff, write_conf=a.write_conf,
+                                write_overlap=a.write_overlap, lambda_vis=a.lambda_vis, burn_in=a.burn_in, p_fn=a.p_fn,
+                                max_lost=a.max_lost, max_occ_len=10, p_occ_both=0.2, cross_iou=0.5, gt_root=a.dancetrack)
+        assoc = AssocModel.from_args(ar, 256).to(dev)
+        ack = dict(args=vars(ar))
+        print(f'módulo de asociación: DESDE CERO ({a.update}), {sum(p.numel() for p in assoc.parameters()) / 1e6:.2f}M parámetros', flush=True)
+    assoc.train()
     ar.p_cross_occ, ar.w_cross = 0.0, 1.0  # sin opciones de cruces en esta fase
+    scratch = not a.assoc_ckpt
+    ss_warmup = a.ss_warmup if a.ss_warmup is not None else (3 if scratch else 0)
+    det_freeze = a.det_freeze_steps if a.det_freeze_steps is not None else (1000 if scratch else 0)
     matcher = det.criterion.matcher
 
     dec_params = [p for p in det.dec.parameters() if p.requires_grad]
-    groups = [dict(params=[p for p in dec_params if p.ndim > 1], lr=a.lr_det, weight_decay=1e-4, base=a.lr_det),
-              dict(params=[p for p in dec_params if p.ndim <= 1], lr=a.lr_det, weight_decay=0.0, base=a.lr_det),
-              dict(params=list(assoc.parameters()), lr=a.lr_mod, weight_decay=1e-4, base=a.lr_mod)]
+    groups = [dict(params=[p for p in dec_params if p.ndim > 1], lr=a.lr_det, weight_decay=1e-4, base=a.lr_det, kind='det'),
+              dict(params=[p for p in dec_params if p.ndim <= 1], lr=a.lr_det, weight_decay=0.0, base=a.lr_det, kind='det'),
+              dict(params=list(assoc.parameters()), lr=a.lr_mod, weight_decay=1e-4, base=a.lr_mod, kind='mod')]
     opt = torch.optim.AdamW(groups)
     scaler = torch.cuda.amp.GradScaler(enabled=(a.amp == 'fp16' and torch.device(dev).type == 'cuda'))
 
@@ -119,6 +138,7 @@ def main(a):
     stop_reason = None
     for ep in range(a.epochs):
         train_ds.seed = a.seed + ep
+        ss_ep = a.ss * min(1.0, ep / ss_warmup) if ss_warmup else a.ss   # rampa de scheduled sampling si el módulo parte de cero
         dl = torch.utils.data.DataLoader(train_ds, batch_size=a.clips_per_step, shuffle=True, num_workers=a.num_workers,
                                          collate_fn=collate_images, drop_last=True)
         run = dict(det=0.0, assoc=0.0, n=0)
@@ -151,14 +171,15 @@ def main(a):
                 clip = dict(emb=cat('emb'), boxes=cat('boxes', lambda x: x.detach()), scores=cat('scores', lambda x: x.detach()),
                             track_id=torch.cat([tid_burn[sb], tid[sl]]) if W else tid[sl], frames=batch['frames'][b],
                             present=batch['present'][b])
-                l, s = run_clip(assoc, clip, ar, dev, train=True, ss=a.ss)
+                l, s = run_clip(assoc, clip, ar, dev, train=True, ss=ss_ep)
                 tot = tot + l; wn += s['w']
             loss_assoc = tot / max(wn, 1.0)
             loss = loss_det + a.lambda_assoc * loss_assoc
 
             f = min(1.0, (step + 1) / max(a.warmup_steps, 1))
+            f_det = 0.0 if step < det_freeze else min(1.0, (step - det_freeze + 1) / max(a.warmup_steps, 1))   # decoder congelado al principio
             for g in opt.param_groups:
-                g['lr'] = g['base'] * f
+                g['lr'] = g['base'] * (f if g['kind'] == 'mod' else f_det)
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -201,7 +222,18 @@ def main(a):
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--det-ckpt', required=True, help='best.pth del detector (Fase 3)')
-    p.add_argument('--assoc-ckpt', required=True, help='best.pth del módulo de asociación (Fase 6), se usa como inicialización')
+    p.add_argument('--assoc-ckpt', default=None, help='best.pth del módulo de la Fase 6 como inicialización; SIN él el módulo se entrena desde cero con los argumentos de abajo')
+    p.add_argument('--det-freeze-steps', type=int, default=None, help='pasos iniciales con el decoder a lr 0 (solo aprende el módulo); por defecto 1000 desde cero, 0 con checkpoint')
+    p.add_argument('--ss-warmup', type=int, default=None, help='épocas de rampa de scheduled sampling 0 -> --ss; por defecto 3 desde cero, 0 con checkpoint')
+    # módulo desde cero (se ignoran si hay --assoc-ckpt)
+    p.add_argument('--update', default='hist', choices=['none', 'ema', 'gru', 'graph', 'graph2', 'hist'])
+    p.add_argument('--hist-aff', choices=['none', 'max'], default='none'); p.add_argument('--hist-len', type=int, default=8)
+    p.add_argument('--write-conf', type=float, default=0.5); p.add_argument('--write-overlap', type=float, default=0.5)
+    p.add_argument('--lambda-vis', type=float, default=0.5); p.add_argument('--burn-in', type=int, default=10)
+    p.add_argument('--dim', type=int, default=256); p.add_argument('--hidden', type=int, default=256)
+    p.add_argument('--app-aff', choices=['mlp', 'cos'], default='cos'); p.add_argument('--ema-alpha', type=float, default=0.9)
+    p.add_argument('--graph-radius', type=float, default=2.0); p.add_argument('--p-fn', type=float, default=0.1)
+    p.add_argument('--max-lost', type=int, default=30)
     p.add_argument('--config', default=DEFAULT_CONFIG)
     p.add_argument('--dancetrack', default=os.environ.get('DANCETRACK_DIR'))
     p.add_argument('--train-roots', nargs='*', default=None, help='carpetas con secuencias de train (por defecto <dancetrack>/train1 y train2)')
@@ -216,7 +248,7 @@ if __name__ == '__main__':
     p.add_argument('--lambda-assoc', type=float, default=10.0, help='peso de la pérdida de asociación frente a la de detección (sin ajustar)')
     p.add_argument('--clip-det', type=float, default=0.1); p.add_argument('--clip-mod', type=float, default=1.0)
     p.add_argument('--warmup-steps', type=int, default=200)
-    p.add_argument('--ss', type=float, default=0.5, help='scheduled sampling constante (el módulo ya viene entrenado)')
+    p.add_argument('--ss', type=float, default=0.5, help='scheduled sampling (constante con checkpoint; con --ss-warmup, valor final de la rampa)')
     p.add_argument('--top-k', type=int, default=100); p.add_argument('--min-iou', type=float, default=0.5)
     p.add_argument('--amp', choices=['fp16', 'bf16', 'none'], default='fp16')
     p.add_argument('--no-flip', action='store_true')
