@@ -35,7 +35,7 @@ def step(model, tr, E, D, sc, frame, choose, valid=None):
     iou = box_iou_cxcywh(new_b, tr.tb)
     iou.fill_diagonal_(0)
     overlap = iou.max(1).values if len(tr) > 1 else torch.zeros(len(tr), device=E.device)
-    tr.S = model.update(tr.S, idx, conf, overlap.detach(), E, geo, p)
+    tr.S = model.update(tr.S, idx, conf, overlap.detach(), E, geo, p, tb=new_b.detach(), gap=torch.where(obs, torch.zeros_like(gap), gap))
     tr.tb = new_b
     tr.last = torch.where(obs, torch.full_like(tr.last, int(frame)), tr.last)
     return logits, idx
