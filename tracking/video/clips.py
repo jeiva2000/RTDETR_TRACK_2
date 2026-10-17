@@ -55,6 +55,13 @@ def crossing_pairs(seq_dir, iou_thr):
     return out
 
 
+def gt_presence(seq_dir):
+    """{frame: set(ids GT presentes)}: quién está en escena en cada frame según el GT (visible u ocluido)."""
+    gt = read_mot(os.path.join(seq_dir, 'gt', 'gt.txt'))
+    gt = gt[gt[:, 6] != 0]
+    return {int(f): set(int(i) for i in rows[:, 1]) for f, rows in by_frame(gt).items()}
+
+
 def find_seq_dir(gt_root, seq):
     for d in ('train1', 'train2', 'val', ''):
         p = os.path.join(gt_root, d, seq)
@@ -90,13 +97,14 @@ class _ClipBase(torch.utils.data.Dataset):
 
 class CachedClipDataset(_ClipBase):
     """Cada item: dict con emb (T,K,256), boxes (T,K,4), scores (T,K), track_id (T,K; -1 fondo), match_iou (T,K),
-    frames (T,), seq (str), cross (lista T de pares GT que se cruzan; vacía si no hay gt_root)."""
+    frames (T,), seq (str), cross (lista T de pares GT que se cruzan) y present (lista T de sets de IDs GT en escena; None si no hay gt_root)."""
 
     def __init__(self, cache_dir, seqs=None, T=10, samples_per_epoch=1000, max_stride=1, p_skip=0.0, max_skip=0, seed=0,
                  gt_root=None, cross_iou=0.5, p_cross=0.0):
         seqs = seqs or sorted(f[:-3] for f in os.listdir(cache_dir) if f.endswith('.pt'))
         self.data = {s: torch.load(os.path.join(cache_dir, f'{s}.pt')) for s in seqs}
         cross = {s: crossing_pairs(find_seq_dir(gt_root, s), cross_iou) for s in seqs} if gt_root else None
+        self.present = {s: gt_presence(find_seq_dir(gt_root, s)) for s in seqs} if gt_root else None
         super().__init__(seqs, {s: d['emb'].shape[0] for s, d in self.data.items()}, T, samples_per_epoch,
                          max_stride, p_skip, max_skip, seed, cross, p_cross)
 
@@ -105,7 +113,8 @@ class CachedClipDataset(_ClipBase):
         d, ix = self.data[s], torch.tensor(fr) - 1
         return dict(emb=d['emb'][ix].float(), boxes=d['boxes'][ix], scores=d['scores'][ix],
                     track_id=d['track_id'][ix].long(), match_iou=d['match_iou'][ix], frames=torch.tensor(fr), seq=s,
-                    cross=self._cross(s, fr))
+                    cross=self._cross(s, fr),
+                    present=[self.present[s].get(f, set()) for f in fr] if self.present else None)
 
 
 class ImageClipDataset(_ClipBase):

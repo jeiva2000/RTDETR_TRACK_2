@@ -3,6 +3,8 @@
 Por frame: afinidad de cada track con las K queries + "no aparece" -> Hungarian global sobre log-probabilidades ->
 actualización del estado. Nacimientos: queries no asignadas con score >= --birth-thresh que no solapan (IoU < --birth-nms)
 con detecciones asignadas ni con otros nacimientos (NMS voraz por score). Muerte: más de --max-lost frames sin ver.
+Variante hist: la visibilidad predicha puede ajustar cuánto se mantiene un track sin ver (--max-lost-occluded y --max-lost-out;
+por defecto iguales a --max-lost, es decir, sin efecto).
 Uso: python -m tracking.assoc.track --ckpt <assoc best.pth> --cache <val cache> --out <dir>; luego tracking.baseline.evaluate.
 """
 import argparse, os, sys
@@ -18,7 +20,7 @@ from tracking.baseline.mot_io import write_mot
 def track_sequence(model, d, a, device):
     E_all, D_all, sc_all = d['emb'].to(device).float(), d['boxes'].to(device), d['scores'].to(device)
     W, H = d['meta']['width'], d['meta']['height']
-    tr, next_id, rows = Tracks(model.proj[0].out_features, device), 1, []
+    tr, next_id, rows = Tracks(model.proj[0].out_features, device, hist=model.hist_len if model.update_type == 'hist' else 0), 1, []
     for t in range(E_all.shape[0]):
         frame = t + 1
         E, D, sc = E_all[t], D_all[t], sc_all[t]
@@ -30,7 +32,12 @@ def track_sequence(model, d, a, device):
                     used[j] = True
                     cx, cy, w, h = D[j].tolist()
                     rows.append((frame, tr.ids[i], (cx - w / 2) * W, (cy - h / 2) * H, w * W, h * H, float(sc[j])))
-            tr.keep(frame - tr.last <= a.max_lost)
+            if model.update_type == 'hist':  # tiempo de vida según la visibilidad predicha: 0 visible, 1 ocluido, 2 fuera
+                v = tr.vis.argmax(-1)
+                limit = torch.where(v == 1, torch.full_like(v, a.max_lost_occluded), torch.where(v == 2, torch.full_like(v, a.max_lost_out), torch.full_like(v, a.max_lost)))
+            else:
+                limit = a.max_lost
+            tr.keep(frame - tr.last <= limit)
         cand = [j for j in torch.argsort(sc, descending=True).tolist() if not used[j] and sc[j] >= a.birth_thresh]
         taken = D[used]
         born = []
@@ -42,7 +49,11 @@ def track_sequence(model, d, a, device):
         if born:
             j = torch.tensor(born, device=device)
             ids = list(range(next_id, next_id + len(born))); next_id += len(born)
-            tr.add(ids, model.init_state(E[j]), D[j], frame)
+            if model.update_type == 'hist':
+                S0, p0 = model.birth(E[j])
+                tr.add(ids, S0, D[j], frame, p=p0)
+            else:
+                tr.add(ids, model.init_state(E[j]), D[j], frame)
             for i, k in zip(ids, born):
                 cx, cy, w, h = D[k].tolist()
                 rows.append((frame, i, (cx - w / 2) * W, (cy - h / 2) * H, w * W, h * H, float(sc[k])))
@@ -54,12 +65,15 @@ if __name__ == '__main__':
     p.add_argument('--ckpt', required=True); p.add_argument('--cache', required=True); p.add_argument('--out', required=True)
     p.add_argument('--seqs', nargs='*', default=None)
     p.add_argument('--birth-thresh', type=float, default=0.5); p.add_argument('--birth-nms', type=float, default=0.7)
+    p.add_argument('--max-lost-occluded', type=int, default=None, help='[hist] por defecto = --max-lost')
+    p.add_argument('--max-lost-out', type=int, default=None, help='[hist] por defecto = --max-lost')
     p.add_argument('--max-lost', type=int, default=30); p.add_argument('--min-prob', type=float, default=0.0)
     p.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     a = p.parse_args()
     ck = torch.load(a.ckpt, map_location='cpu'); ar = ck['args']
-    model = AssocModel(ar['update'], in_dim=ck['model']['proj.0.weight'].shape[1], dim=ar['dim'], hidden=ar['hidden'],
-                       ema_alpha=ar['ema_alpha'], graph_radius=ar['graph_radius'], app_aff=ar.get('app_aff', 'mlp')).to(a.device).eval()
+    a.max_lost_occluded = a.max_lost if a.max_lost_occluded is None else a.max_lost_occluded
+    a.max_lost_out = a.max_lost if a.max_lost_out is None else a.max_lost_out
+    model = AssocModel.from_args(ar, ck['model']['proj.0.weight'].shape[1]).to(a.device).eval()
     model.load_state_dict(ck['model'])
     seqs = a.seqs or sorted(f[:-3] for f in os.listdir(a.cache) if f.endswith('.pt'))
     for s in seqs:

@@ -71,8 +71,7 @@ def main(a):
     cfg = YAMLConfig(a.config, PResNet=dict(pretrained=False))
     det = Detector(cfg, a.det_ckpt, dev, a.amp)
     ack = torch.load(a.assoc_ckpt, map_location='cpu'); ar = argparse.Namespace(**ack['args'])
-    assoc = AssocModel(ar.update, in_dim=ack['model']['proj.0.weight'].shape[1], dim=ar.dim, hidden=ar.hidden, ema_alpha=ar.ema_alpha,
-                       graph_radius=ar.graph_radius, app_aff=ar.app_aff).to(dev)
+    assoc = AssocModel.from_args(ar, ack['model']['proj.0.weight'].shape[1]).to(dev)
     assoc.load_state_dict(ack['model']); assoc.train()
     ar.p_cross_occ, ar.w_cross = 0.0, 1.0  # sin opciones de cruces en esta fase
     matcher = det.criterion.matcher
