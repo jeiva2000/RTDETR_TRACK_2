@@ -68,3 +68,51 @@ python -m tracking.assoc.diagnose decisions --ckpt $OUTPUT_ROOT/assoc_hist_A_s1/
 5. **Variante `hist`:** probada solo con datos sintéticos. Allí no mejoró la re-identificación tras ausencias largas y el
    resultado entre semillas varió mucho; en DanceTrack real es una prueba abierta.
 6. **Logs:** `logs/<job>_<id>.out/.err` (hay que crear `logs/`). Los de entrenamiento también van a `$OUTPUT_ROOT/<RUN_NAME>.log`.
+
+---
+
+# Fase 7: fine-tuning conjunto con la variante `hist` (detector descongelado en el decoder)
+
+Entrena **a la vez** el decoder del detector y el módulo de asociación `hist`, con extracción en línea (sin caché). Backbone y encoder
+quedan congelados. Pérdida = detección completa de RT-DETRv2 (con denoising) sobre los frames principales de cada clip + `λ` ×
+(asociación + visibilidad), con gradiente hacia el decoder a través de los embeddings. Los primeros `burn-in` frames de cada clip se
+extraen en modo eval y sin gradiente (llenan estado e historial; no entran en la pérdida de detección). `lr`: decoder 2e-5, módulo 1e-3.
+
+## Requisitos
+1. El detector (`best.pth`) y un módulo `hist` ya entrenado en la Fase 6 (p. ej. `assoc_hist_A_s1/best.pth`), que se usa como inicialización.
+2. `DANCETRACK_DIR` con `train1/ train2/ val/` (el entrenamiento lee imágenes y GT directamente).
+3. Una GPU grande (A100). **Memoria sin medir:** con 2 clips por paso son 2 × T frames con gradiente por el decoder; si falta, baja `--clips-per-step` o `--T`.
+
+## Lanzar (un entrenamiento)
+```bash
+cd ~/work/RTDETR_TRACK_2 && git pull && mkdir -p logs
+DET_CKPT=/ruta/detector/best.pth ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth RUN_NAME=joint_hist \
+  EXTRA="--samples-per-epoch 400 --epochs 15" sbatch slurm/train_joint.sbatch
+```
+`--samples-per-epoch 400` hace épocas cortas (200 pasos) para vigilar el DetA con frecuencia: en la prueba anterior la caída apareció en la
+primera época de 500 pasos. Los demás valores por defecto son: `λ_assoc` = 10, `--lr-det 2e-5`, tolerancia de DetA 0.5 puntos (umbral 0.6, stride 2).
+
+## Recomendado: barrido de λ (4 entrenamientos en paralelo, una GPU cada uno)
+```bash
+DET_CKPT=/ruta/detector/best.pth ASSOC_CKPT=$OUTPUT_ROOT/assoc_hist_A_s1/best.pth BASE=joint_hist \
+  EXTRA="--samples-per-epoch 400 --epochs 15" sbatch slurm/joint_lambda_sweep.sbatch
+```
+Lanza `λ` = 0, 1, 3 y 10. **`λ` = 0 es el control:** si el DetA baja igualmente, la causa es el régimen de ajuste y no la asociación.
+Resultados en `$OUTPUT_ROOT/joint_hist_l<λ>/`. Mira `log.txt` (una línea JSON por época: `DetA`, `DetA_by_thr`, `val_acc`, `val_vis_acc`)
+y la línea final de `train.log`.
+
+## Control de parada
+Si el DetA (umbral 0.6) cae más de 0.5 puntos por debajo del inicial, el entrenamiento **informa y se detiene**. `*_best.pth` es la mejor
+`val_acc` entre las épocas válidas; si ninguna lo fue no se crean, y el punto de partida sigue siendo lo mejor. `*_last.pth` se guarda siempre.
+
+## Evaluar el resultado (caché de val con el detector ajustado + baselines con ese detector + tabla)
+```bash
+RUN_NAME=joint_hist_l3 bash tracking/scripts/eval_joint.sh hpc            # usa detector_best.pth y assoc_best.pth; WHICH=last para los de la última época
+```
+Para añadir la fila de la Fase 6 con el detector congelado: `EXTRA_JSONS="hist_congelado=$OUTPUT_ROOT/assoc_hist_A_s1/eval.json"`.
+
+## Lo que no está validado
+- Con la variante `hist` solo hay pruebas sintéticas (CPU); en DanceTrack real no se ha ejecutado ni la Fase 6 ni la 7 con ella.
+- La primera prueba de la Fase 7 (variante `graph`, `λ` = 10, 1 época) **empeoró** DetA (−1.07), `val_acc` y el tracking (HOTA −5.1).
+  El experimento de control (`λ` = 0) no tiene resultados todavía. Los valores de `λ`, `--lr-det` y la tolerancia son elecciones sin ajustar.
+- Tiempos y memoria de los `.sbatch` sin medir.

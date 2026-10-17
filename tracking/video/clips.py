@@ -132,6 +132,7 @@ class ImageClipDataset(_ClipBase):
         self.flip = flip
         self.info = {s: read_seqinfo(self.dirs[s]) for s in seqs}
         self.gt = {s: load_gt(self.dirs[s], self.info[s]) for s in seqs}
+        self.present = {s: gt_presence(self.dirs[s]) for s in seqs}   # quién está en escena en cada frame (para la visibilidad)
         super().__init__(seqs, {s: self.info[s]['length'] for s in seqs}, T, samples_per_epoch,
                          max_stride, p_skip, max_skip, seed)
 
@@ -142,9 +143,10 @@ class ImageClipDataset(_ClipBase):
         if self.flip and random.Random(self.seed * 999983 + i).random() < 0.5:
             images = images.flip(-1)
             gts = [torch.cat([g[:, :1], 1 - g[:, 1:2], g[:, 2:]], 1) if len(g) else g for g in gts]
-        return dict(images=images, gts=gts, frames=torch.tensor(fr), seq=s)
+        return dict(images=images, gts=gts, frames=torch.tensor(fr), seq=s, present=[self.present[s].get(f, set()) for f in fr])
 
 
 def collate_images(batch):
     return dict(images=torch.stack([b['images'] for b in batch]), gts=[b['gts'] for b in batch],
-                frames=torch.stack([b['frames'] for b in batch]), seq=[b['seq'] for b in batch])
+                frames=torch.stack([b['frames'] for b in batch]), seq=[b['seq'] for b in batch],
+                present=[b.get('present') for b in batch])

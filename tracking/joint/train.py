@@ -83,11 +83,12 @@ def main(a):
     opt = torch.optim.AdamW(groups)
     scaler = torch.cuda.amp.GradScaler(enabled=(a.amp == 'fp16' and torch.device(dev).type == 'cuda'))
 
-    kw = dict(T=a.T, max_stride=a.max_stride, p_skip=a.p_skip, max_skip=a.max_skip)
+    W = int(getattr(ar, 'burn_in', 0))  # frames iniciales de cada clip (solo la variante hist): llenan estado e historial sin gradiente
+    print(f'variante {ar.update}; burn-in {W}; clips de {W} + {a.T} frames', flush=True)
     roots = a.train_roots or [os.path.join(a.dancetrack, 'train1'), os.path.join(a.dancetrack, 'train2')]
-    train_ds = ImageClipDataset(roots, T=a.T, samples_per_epoch=a.samples_per_epoch, max_stride=a.max_stride, p_skip=a.p_skip,
+    train_ds = ImageClipDataset(roots, T=a.T + W, samples_per_epoch=a.samples_per_epoch, max_stride=a.max_stride, p_skip=a.p_skip,
                                 max_skip=a.max_skip, seed=a.seed, flip=not a.no_flip)
-    val_ds = ImageClipDataset(a.val_root, T=a.T, samples_per_epoch=a.val_clips, max_stride=a.max_stride, p_skip=a.p_skip,
+    val_ds = ImageClipDataset(a.val_root, T=a.T + W, samples_per_epoch=a.val_clips, max_stride=a.max_stride, p_skip=a.p_skip,
                               max_skip=a.max_skip, seed=12345)
     val_seqs = a.eval_seqs or sorted(val_ds.dirs)
     json.dump(dict(vars(a), assoc_args=ack['args']), open(os.path.join(a.out, 'args.json'), 'w'), indent=1)
@@ -123,22 +124,33 @@ def main(a):
         run = dict(det=0.0, assoc=0.0, n=0)
         t0 = time.time()
         for batch in dl:
-            B, T = batch['images'].shape[:2]
-            images = batch['images'].flatten(0, 1).to(dev)
-            targets = [dict(labels=torch.zeros(len(g), dtype=torch.long, device=dev), boxes=g[:, 1:5].to(dev).float())
-                       for gts in batch['gts'] for g in gts]
+            B, TT = batch['images'].shape[:2]
+            T = TT - W
+            q_burn = None
+            if W:  # burn-in: extracción en modo eval y sin gradiente (como en inferencia); no entra en la pérdida de detección
+                with torch.no_grad():
+                    lg, bx, em = extract_eval(batch['images'][:, :W].flatten(0, 1).to(dev))
+                    q_burn = topk_queries(lg.float(), bx.float(), em.float(), a.top_k)
+                    gts_burn = [g for gts in batch['gts'] for g in gts[:W]]
+                    tid_burn, _ = match_queries(matcher, q_burn, gts_burn, dev, a.min_iou)
+                det.set_train(True)
+            images = batch['images'][:, W:].flatten(0, 1).to(dev)
+            gts_main = [g for gts in batch['gts'] for g in gts[W:]]
+            targets = [dict(labels=torch.zeros(len(g), dtype=torch.long, device=dev), boxes=g[:, 1:5].to(dev).float()) for g in gts_main]
             out, emb = det.forward(images, targets)
             with torch.autocast(device_type=torch.device(dev).type, enabled=False):
                 loss_dict = det.criterion(out, targets, epoch=ep, step=step, global_step=step)
             loss_det = sum(loss_dict.values())
 
             q = topk_queries(out['pred_logits'].float(), out['pred_boxes'].float(), emb.float(), a.top_k)
-            tid, _ = match_queries(matcher, q, [g for gts in batch['gts'] for g in gts], dev, a.min_iou)
+            tid, _ = match_queries(matcher, q, gts_main, dev, a.min_iou)
             tot, wn = 0.0, 0.0
             for b in range(B):
-                sl = slice(b * T, (b + 1) * T)
-                clip = dict(emb=q['emb'][sl], boxes=q['boxes'][sl].detach(), scores=q['scores'][sl].detach(),
-                            track_id=tid[sl], frames=batch['frames'][b])
+                sl, sb = slice(b * T, (b + 1) * T), slice(b * W, (b + 1) * W)
+                cat = (lambda k, f=(lambda x: x): torch.cat([f(q_burn[k][sb]), f(q[k][sl])])) if W else (lambda k, f=(lambda x: x): f(q[k][sl]))
+                clip = dict(emb=cat('emb'), boxes=cat('boxes', lambda x: x.detach()), scores=cat('scores', lambda x: x.detach()),
+                            track_id=torch.cat([tid_burn[sb], tid[sl]]) if W else tid[sl], frames=batch['frames'][b],
+                            present=batch['present'][b])
                 l, s = run_clip(assoc, clip, ar, dev, train=True, ss=a.ss)
                 tot = tot + l; wn += s['w']
             loss_assoc = tot / max(wn, 1.0)

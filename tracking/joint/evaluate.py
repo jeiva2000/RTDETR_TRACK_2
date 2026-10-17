@@ -85,7 +85,8 @@ def eval_assoc_live(extract, matcher, assoc, ds, ar, device, top_k, min_iou):
         logits, boxes, emb = extract(c['images'].to(device))
         q = topk_queries(logits, boxes, emb, top_k)
         tid, _ = match_queries(matcher, q, c['gts'], device, min_iou)
-        clip = dict(emb=q['emb'].float(), boxes=q['boxes'].float(), scores=q['scores'].float(), track_id=tid, frames=c['frames'])
+        clip = dict(emb=q['emb'].float(), boxes=q['boxes'].float(), scores=q['scores'].float(), track_id=tid, frames=c['frames'],
+                    present=c.get('present'))
         l, s = run_clip(assoc, clip, ar, device, train=False, ss=1.0)
         tot['loss'] += float(l)
         for k in ('n', 'w', 'ok', 'ok_present', 'present'):
