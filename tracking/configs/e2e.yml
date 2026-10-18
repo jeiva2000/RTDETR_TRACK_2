@@ -1,0 +1,27 @@
+# Módulo de tracking e2e (tracking/e2e/). Los valores por defecto están en tracking/e2e/config.py; aquí solo lo que se quiere fijar.
+# Hito H1: tracker mínimo sobre la caché (detector congelado), q_det + caja, EMA fija. Los hitos siguientes añaden claves (movimiento,
+# grafo, banco, a_det, ruido, descongelar el decoder) y banderas de ablación en la sección `ablation`.
+e2e:
+  enabled: true            # false = solo detección (el solver e2e se niega a arrancar)
+tokens:
+  top_k: 100               # debe coincidir con --top-k de cache_features
+  a_det: none              # H5: roialign | deform
+state:
+  max_tracks: 64
+  max_age: 30
+appearance:
+  mode: ema                # H1: apariencia por EMA fija (equivalente a la variante assoc `ema`)
+  alpha_app: 0.1
+train:                     # misma receta que tracking/assoc/train.py
+  T: 10
+  burn_in: 0
+  batch: 8
+  epochs: 20
+  samples_per_epoch: 2000
+  p_fn: 0.1
+  ss_max: 0.5
+  ss_warmup: 5
+  lr: 1.0e-3
+infer:
+  birth_thr: 0.5
+  birth_nms: 0.7
