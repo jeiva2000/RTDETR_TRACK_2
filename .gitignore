@@ -177,3 +177,4 @@ setup_env/paths.hpc.env
 logs/*
 !logs/.gitkeep
 output/
+outputs/

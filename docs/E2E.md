@@ -60,10 +60,12 @@ en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso
 Por ahora **no** se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull                            # logs/ ya viene en el repo (Slurm la necesita antes de arrancar)
-cp setup_env/paths.hpc.env.example setup_env/paths.hpc.env      # rutas absolutas (si aún no existe)
+cp setup_env/paths.hpc.env.example setup_env/paths.hpc.env      # rutas absolutas (si aún no existe); las salidas van por defecto a <repo>/outputs
 # edita en slurm/e2e.slurm: la cabecera #SBATCH (--partition, --gres, --nodelist, --cpus-per-task, --mem, -t) y el bloque CONFIGURACIÓN
 sbatch slurm/e2e.slurm
 ```
+**Salidas:** por defecto en `outputs/` dentro del repositorio (`OUTPUT_ROOT`, ignorada por git; fíjala en `paths.hpc.env` si prefieres otra ruta, p. ej. otro disco: los checkpoints y las cachés ocupan varios GB).
+
 **Datos que deben estar preparados antes (Fase 2):** el COCO de train (`$COCO_DIR/detector_train/annotations/train.json`, mezcla de DanceTrack y CrowdHuman con `merge_coco.py`), el COCO de val
 (`$COCO_DIR/dancetrack/annotations/val.json`), DanceTrack en `$DANCETRACK_DIR` (`train1/ train2/ val/`) y el checkpoint COCO en `$CKPT_DIR`. El script lo comprueba al empezar y, si falta el checkpoint COCO,
 intenta descargarlo (los nodos de cómputo pueden no tener internet: descárgalo antes desde el login con `bash setup_env/download_ckpt.sh hpc`). Si el trabajo se corta en la etapa 2, al relanzarlo la etapa 1 se salta
@@ -123,3 +125,17 @@ globales y en cruces). **Solo se ha verificado con datos sintéticos en CPU**; l
 ### Próximos hitos
 H2 predictor de movimiento (GRU con σ) · H3 transformer de grafo · H4 banco histórico · H5 `a_det` (RoIAlign; vector por query en la caché mientras el detector esté
 congelado) · H6 ruido de entrenamiento · H7 descongelar el decoder (BN en eval, DDP, control de AP y DetA).
+
+## Preparación automática de datos (etapa 0 de `slurm/e2e.slurm`)
+
+Antes de entrenar, el `.slurm` comprueba y prepara solo lo que falta (idempotente, con `flock` en `$DATA_ROOT/.data_prep.lock`):
+
+1. DanceTrack en `$DANCETRACK_DIR` (20/20/25 secuencias con `gt.txt`) → `setup_env/download_dancetrack.sh`.
+2. COCO de DanceTrack en `$COCO_DIR/dancetrack/annotations/{train,val}.json` → `tracking/data/convert_dancetrack.py`.
+3. Si `USE_CROWDHUMAN=1` (por defecto): CrowdHuman (`download_crowdhuman.sh … full`) y su COCO (`convert_crowdhuman.py`).
+4. Mezcla `$COCO_DIR/detector_train/annotations/train.json` → `merge_coco.py` (se rehace si una entrada es más nueva).
+
+Variables: `PREPARE_DATA` (0 = solo comprobar), `USE_CROWDHUMAN` (0 = detector solo con DanceTrack; se aparta del plan), `DT_STRIDE_TRAIN`, `DT_STRIDE_VAL`.
+Descargar necesita internet en el nodo de cómputo; si no lo hay el trabajo falla con un mensaje que indica el comando a ejecutar antes desde el login.
+Un JSON cortado (escritura interrumpida) se detecta y se regenera; una descarga/extracción interrumpida de DanceTrack o CrowdHuman hay que borrarla a mano.
+Verificado solo con stubs (sin descargas reales): primera pasada ejecuta todo en orden; segunda no ejecuta nada.

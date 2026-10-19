@@ -33,6 +33,13 @@ ENV_NAME="${ENV_NAME:-hpc}"                  # archivo de rutas: setup_env/paths
 source setup_env/load.sh "$ENV_NAME"
 
 # ============================== CONFIGURACIÓN (EDITA AQUÍ) ==============================
+# --- Etapa 0: preparación de datos (solo se ejecuta lo que FALTA; todo se salta si ya está) ---
+PREPARE_DATA="${PREPARE_DATA:-1}"                       # 0 = no preparar nada (los datos ya están; solo se comprueba que existan)
+USE_CROWDHUMAN="${USE_CROWDHUMAN:-1}"                   # 1 = el detector entrena con DanceTrack + CrowdHuman (como en el plan); 0 = solo DanceTrack (se aparta del plan)
+DATASETS_DIR="${DATASETS_DIR:-/home/serperzar/datasets}"   # carpeta con datasets ya descargados (DanceTrack/, CrowdHuman/): si están completos se enlazan en $DATA_ROOT y NO se descarga ('' = no buscar)
+DT_STRIDE_TRAIN="${DT_STRIDE_TRAIN:-2}"                 # 1 de cada N frames de train de DanceTrack en el COCO del detector
+DT_STRIDE_VAL="${DT_STRIDE_VAL:-1}"                     # idem para val (la validación del detector se hace en cada época: 2 la acorta)
+DT_EXPECT_TRAIN1="${DT_EXPECT_TRAIN1:-20}"; DT_EXPECT_TRAIN2="${DT_EXPECT_TRAIN2:-20}"; DT_EXPECT_VAL="${DT_EXPECT_VAL:-25}"   # nº de secuencias de DanceTrack
 # --- Etapa 1: entrenamiento de RT-DETR ---
 DET_RUN_NAME="${DET_RUN_NAME:-detector_r50vd_person}"   # carpeta de salida en $OUTPUT_ROOT; su best.pth es el checkpoint de detección
 DET_EPOCHS="${DET_EPOCHS:-24}"                          # épocas máximas (el early stopping puede parar antes: patience/min_delta en tracking/configs/detector_r50vd_person.yml)
@@ -81,6 +88,10 @@ export TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS:-8.0;8.6}"   # cubre A30/A100 (8.0) y 
 #export TORCH_DISTRIBUTED_DEBUG=DETAIL
 #export NCCL_ASYNC_ERROR_HANDLING=1
 
+net_ok() {   # net_ok <host>: ¿hay acceso a internet? (los nodos de cómputo pueden no tenerlo)
+  [ "${NET_CHECK:-1}" = "0" ] || timeout 15 bash -c "exec 3<>/dev/tcp/$1/443" 2>/dev/null
+}
+
 # --- Entorno conda: si no existe se crea (con candado, por si coinciden varios trabajos); si existe, solo se activa ---
 if [ -f "$CONDA_SH" ]; then source "$CONDA_SH"; else eval "$(conda shell.bash hook)"; fi
 : "${CONDA_ENV:?define CONDA_ENV en setup_env/paths.${ENV_NAME}.env}"
@@ -90,7 +101,7 @@ env_exists() {   # CONDA_ENV puede ser un nombre o una ruta absoluta (conda crea
 create_env() {
   echo "[conda] el entorno '$CONDA_ENV' no existe: se crea (python $PYTHON_VERSION, torch $TORCH_VERSION, requisitos del proyecto)"
   # los nodos de cómputo pueden no tener internet: se comprueba antes de empezar (CREATE_ENV_NET_CHECK=0 lo desactiva)
-  if [ "${CREATE_ENV_NET_CHECK:-1}" = "1" ] && ! timeout 15 bash -c 'exec 3<>/dev/tcp/pypi.org/443' 2>/dev/null; then
+  if [ "${CREATE_ENV_NET_CHECK:-1}" = "1" ] && ! net_ok pypi.org; then
     echo "ERROR: este nodo no tiene acceso a internet para crear el entorno '$CONDA_ENV'. Créalo antes desde el login (bash setup_env/setup_hpc.sh) y relanza." >&2; exit 1
   fi
   local TARGET=(-n "$CONDA_ENV"); [[ "$CONDA_ENV" == /* ]] && TARGET=(-p "$CONDA_ENV")
@@ -138,6 +149,77 @@ echo "Job $SLURM_JOB_ID en $(hostname): $NGPU GPU(s) | detector: $DET_OUT (lote 
 #export OMP_NUM_THREADS=1
 
 need() { [ -e "$1" ] || { echo "ERROR: falta $1 ($2)" >&2; exit 1; }; }
+
+# ============================== ETAPA 0: preparación de datos (solo lo que falta) ==============================
+# Idempotente y con candado: si ya existen (y están completos) no se ejecuta nada. Descargar necesita internet en el nodo (se comprueba).
+# Archivos que prepara: DanceTrack en $DANCETRACK_DIR, su COCO (train/val + IDs de track) en $COCO_DIR/dancetrack, CrowdHuman en $CROWDHUMAN_DIR, su COCO en
+# $COCO_DIR/crowdhuman y la mezcla $COCO_DIR/detector_train/annotations/train.json (entrenamiento del detector).
+count_dirs() { if [ -d "$1" ]; then find "$1" -mindepth 1 -maxdepth 1 -type d | wc -l; else echo 0; fi; }
+json_ok() { [ -s "$1" ] && python -c "import json,sys; json.load(open(sys.argv[1]))" "$1" 2>/dev/null; }   # existe y es JSON completo (una escritura cortada no vale)
+dancetrack_ok() {   # dancetrack_ok [dir]
+  local D="${1:-$DANCETRACK_DIR}"
+  [ "$(count_dirs "$D/train1")" -ge "$DT_EXPECT_TRAIN1" ] && [ "$(count_dirs "$D/train2")" -ge "$DT_EXPECT_TRAIN2" ] && \
+  [ "$(count_dirs "$D/val")" -ge "$DT_EXPECT_VAL" ] && \
+  [ "$(ls "$D"/train1/*/gt/gt.txt "$D"/train2/*/gt/gt.txt "$D"/val/*/gt/gt.txt 2>/dev/null | wc -l)" -ge $((DT_EXPECT_TRAIN1 + DT_EXPECT_TRAIN2 + DT_EXPECT_VAL)) ]
+}
+crowdhuman_ok() {   # crowdhuman_ok [dir]
+  local D="${1:-$CROWDHUMAN_DIR}"
+  [ -s "$D/annotation_train.odgt" ] && [ -d "$D/Images" ] && \
+  [ "$(find "$D/Images" -maxdepth 1 -name '*.jpg' | wc -l)" -ge $(( $(wc -l < "$D/annotation_train.odgt") * 99 / 100 )) ]   # >= 99 % de las imágenes del .odgt
+}
+link_existing() {   # link_existing <ok_fn> <destino> <nombre...>: si hay una copia completa en $DATASETS_DIR y el destino no existe, la enlaza
+  local ok="$1" dest="$2"; shift 2
+  [ -n "$DATASETS_DIR" ] && [ ! -e "$dest" ] && [ ! -L "$dest" ] || return 0
+  for n in "$@"; do
+    if [ -d "$DATASETS_DIR/$n" ] && "$ok" "$DATASETS_DIR/$n"; then
+      echo "[datos] $n ya existe y está completo en $DATASETS_DIR/$n: se enlaza en $dest (sin descargar)"
+      mkdir -p "$(dirname "$dest")"; ln -s "$DATASETS_DIR/$n" "$dest"; return 0
+    fi
+  done
+}
+prepare_data() {
+  link_existing dancetrack_ok "$DANCETRACK_DIR" DanceTrack dancetrack
+  [ "$USE_CROWDHUMAN" = "1" ] && link_existing crowdhuman_ok "$CROWDHUMAN_DIR" CrowdHuman crowdhuman
+  if ! dancetrack_ok; then
+    echo "[datos] DanceTrack ausente o incompleto en $DANCETRACK_DIR: se descarga"
+    net_ok huggingface.co || { echo "ERROR: sin internet en este nodo para descargar DanceTrack. Descárgalo antes desde el login: bash setup_env/download_dancetrack.sh $ENV_NAME" >&2; exit 1; }
+    eval "${DT_DOWNLOAD_CMD:-bash setup_env/download_dancetrack.sh $ENV_NAME}"
+    dancetrack_ok || { echo "ERROR: DanceTrack sigue incompleto tras la descarga (¿extracción interrumpida?). Borra la carpeta incompleta de $DANCETRACK_DIR y relanza." >&2; exit 1; }
+  fi
+  if ! { json_ok "$COCO_DIR/dancetrack/annotations/train.json" && json_ok "$COCO_DIR/dancetrack/annotations/val.json"; }; then
+    echo "[datos] convirtiendo DanceTrack a COCO (stride train $DT_STRIDE_TRAIN, val $DT_STRIDE_VAL)"
+    python tracking/data/convert_dancetrack.py --stride-train "$DT_STRIDE_TRAIN" --stride-val "$DT_STRIDE_VAL"
+  fi
+  INPUTS=("$COCO_DIR/dancetrack/annotations/train.json:$DANCETRACK_DIR")
+  if [ "$USE_CROWDHUMAN" = "1" ]; then
+    if ! crowdhuman_ok; then
+      echo "[datos] CrowdHuman ausente o incompleto en $CROWDHUMAN_DIR: se descarga (train completo, ~8 GB)"
+      net_ok huggingface.co || { echo "ERROR: sin internet en este nodo para descargar CrowdHuman. Descárgalo antes desde el login: bash setup_env/download_crowdhuman.sh $ENV_NAME full (o USE_CROWDHUMAN=0)" >&2; exit 1; }
+      eval "${CH_DOWNLOAD_CMD:-bash setup_env/download_crowdhuman.sh $ENV_NAME full}"
+      crowdhuman_ok || { echo "ERROR: CrowdHuman sigue incompleto tras la descarga. Revisa $CROWDHUMAN_DIR (o USE_CROWDHUMAN=0)." >&2; exit 1; }
+    fi
+    if ! json_ok "$COCO_DIR/crowdhuman/annotations/train.json"; then
+      echo "[datos] convirtiendo CrowdHuman a COCO (las imágenes muy grandes se reducen)"
+      python tracking/data/convert_crowdhuman.py
+    fi
+    INPUTS+=("$COCO_DIR/crowdhuman/annotations/train.json:$CROWDHUMAN_DIR")
+  fi
+  MERGED="$COCO_DIR/detector_train/annotations/train.json"; REBUILD=0
+  json_ok "$MERGED" || REBUILD=1
+  for i in "${INPUTS[@]}"; do [ "${i%%:*}" -nt "$MERGED" ] && REBUILD=1; done          # si una entrada es más nueva que la mezcla, se rehace
+  if [ "$REBUILD" = "1" ]; then
+    echo "[datos] mezclando los COCO de entrenamiento del detector (${#INPUTS[@]} fuente(s)) -> $MERGED"
+    python tracking/data/merge_coco.py --base "$DATA_ROOT" --out "$MERGED" --inputs "${INPUTS[@]}"
+  fi
+}
+if [ "$PREPARE_DATA" = "1" ]; then
+  mkdir -p "$DATA_ROOT"; exec 201>"$DATA_ROOT/.data_prep.lock"
+  command -v flock >/dev/null 2>&1 && flock 201                                            # un solo trabajo prepara los datos a la vez
+  prepare_data
+  command -v flock >/dev/null 2>&1 && flock -u 201
+else
+  echo "[datos] PREPARE_DATA=0: no se prepara nada, solo se comprueba"
+fi
 if [ ! -f "$DET_DONE" ] || [ "$FORCE_DET" = "1" ]; then
   need "$COCO_DIR/detector_train/annotations/train.json" "COCO de train = DanceTrack + CrowdHuman mezclado: python tracking/data/merge_coco.py (Fase 2)"
   need "$COCO_DIR/dancetrack/annotations/val.json" "COCO de val de DanceTrack: python tracking/data/convert_dancetrack.py (Fase 2)"
