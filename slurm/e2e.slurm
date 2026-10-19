@@ -45,9 +45,13 @@ E2E_VARIANT="${E2E_VARIANT:-h1}"                        # variante de tracking/c
 LAMBDA="${LAMBDA:-10}"                                  # peso de la pérdida e2e frente a la de detección (sin ajustar; 0 = solo se ajusta el detector)
 CLIPS_PER_GPU="${CLIPS_PER_GPU:-1}"                     # clips por GPU y paso (lote efectivo = clips por GPU x nº de GPUs)
 JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs)
-# --- Entorno del clúster ---
+# --- Entorno del clúster y de conda ---
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 CLUSTER_MODULES="${CLUSTER_MODULES:-GCC/12.2.0 CUDA/11.8.0}"
+CREATE_ENV="${CREATE_ENV:-1}"                           # 1 = si el entorno conda $CONDA_ENV (de paths.<ENV_NAME>.env) NO existe, crearlo; si existe, solo se activa. 0 = no crearlo nunca
+PYTHON_VERSION="${PYTHON_VERSION:-3.10}"                # versiones usadas SOLO al crear el entorno (coinciden con setup_env/setup_hpc.sh)
+TORCH_VERSION="${TORCH_VERSION:-2.1.2}"; TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.16.2}"
+TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu118}"   # debe corresponder a la versión de CUDA del módulo (11.8 -> cu118)
 # ==========================================================================================
 
 # --- Módulos y entorno CUDA/GCC ---
@@ -77,9 +81,41 @@ export TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS:-8.0;8.6}"   # cubre A30/A100 (8.0) y 
 #export TORCH_DISTRIBUTED_DEBUG=DETAIL
 #export NCCL_ASYNC_ERROR_HANDLING=1
 
-# --- Entorno conda ---
+# --- Entorno conda: si no existe se crea (con candado, por si coinciden varios trabajos); si existe, solo se activa ---
 if [ -f "$CONDA_SH" ]; then source "$CONDA_SH"; else eval "$(conda shell.bash hook)"; fi
-conda activate "${CONDA_ENV:?define CONDA_ENV en setup_env/paths.${ENV_NAME}.env}"
+: "${CONDA_ENV:?define CONDA_ENV en setup_env/paths.${ENV_NAME}.env}"
+env_exists() {   # CONDA_ENV puede ser un nombre o una ruta absoluta (conda create -p)
+  if [[ "$CONDA_ENV" == /* ]]; then [ -d "$CONDA_ENV/conda-meta" ]; else conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV"; fi
+}
+create_env() {
+  echo "[conda] el entorno '$CONDA_ENV' no existe: se crea (python $PYTHON_VERSION, torch $TORCH_VERSION, requisitos del proyecto)"
+  # los nodos de cómputo pueden no tener internet: se comprueba antes de empezar (CREATE_ENV_NET_CHECK=0 lo desactiva)
+  if [ "${CREATE_ENV_NET_CHECK:-1}" = "1" ] && ! timeout 15 bash -c 'exec 3<>/dev/tcp/pypi.org/443' 2>/dev/null; then
+    echo "ERROR: este nodo no tiene acceso a internet para crear el entorno '$CONDA_ENV'. Créalo antes desde el login (bash setup_env/setup_hpc.sh) y relanza." >&2; exit 1
+  fi
+  local TARGET=(-n "$CONDA_ENV"); [[ "$CONDA_ENV" == /* ]] && TARGET=(-p "$CONDA_ENV")
+  # si algo falla (o el trabajo se cancela) a mitad de la creación, se borra el entorno a medias para no tomarlo luego por bueno
+  trap 'echo "[conda] creación interrumpida: se borra el entorno incompleto" >&2; conda env remove -y "${TARGET[@]}" >/dev/null 2>&1 || true; exit 1' ERR TERM INT
+  conda create -y "${TARGET[@]}" -c conda-forge --override-channels python="$PYTHON_VERSION" pip   # conda-forge: evita las condiciones de uso de los canales 'defaults'
+  conda activate "$CONDA_ENV"
+  pip install "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX"
+  pip install -r rtdetrv2_pytorch/requirements.txt "numpy<2"          # numpy<2: torch 2.1.2 no es compatible con NumPy 2
+  pip install -r tracking/requirements.txt "numpy<2"                  # filterpy, lap, scipy
+  python -c "import torch, torchvision, yaml, scipy, filterpy, lap, pycocotools, faster_coco_eval; print('[conda] paquetes verificados: torch', torch.__version__)"
+  trap - ERR TERM INT
+  conda deactivate
+}
+LOCK="${CONDA_ENV_LOCK:-$HOME/.cache/rtdetr_track_env.lock}"; mkdir -p "$(dirname "$LOCK")"
+if command -v flock >/dev/null 2>&1; then exec 200>"$LOCK"; flock 200; fi
+if env_exists; then
+  echo "[conda] el entorno '$CONDA_ENV' ya existe: solo se activa"
+elif [ "$CREATE_ENV" = "1" ]; then
+  create_env
+else
+  echo "ERROR: no existe el entorno conda '$CONDA_ENV' y CREATE_ENV=0" >&2; exit 1
+fi
+conda activate "$CONDA_ENV"
+if command -v flock >/dev/null 2>&1; then flock -u 200; fi
 
 # --- Diagnóstico (queda en el log) ---
 echo "===== ENV ====="

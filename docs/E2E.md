@@ -69,6 +69,11 @@ sbatch slurm/e2e.slurm
 intenta descargarlo (los nodos de cómputo pueden no tener internet: descárgalo antes desde el login con `bash setup_env/download_ckpt.sh hpc`). Si el trabajo se corta en la etapa 2, al relanzarlo la etapa 1 se salta
 pero la 2 empieza de nuevo (el entrenamiento e2e no tiene reanudación). Con `sbatch --export=ALL,FORCE_DET=1 slurm/e2e.slurm` se reentrena el detector aunque exista.
 
+**Entorno conda:** si el entorno de `CONDA_ENV` no existe, el propio `.slurm` lo **crea** (Python 3.10 con `conda-forge`, torch 2.1.2 + torchvision 0.16.2 con el índice `cu118`, los requisitos de RT-DETRv2 y de `tracking/`, y `numpy<2`) y lo verifica; si ya existe, **solo lo activa**. Detalles:
+un candado (`flock`) evita que dos trabajos lo creen a la vez; si la creación falla o se cancela, el entorno a medias se borra; el nodo necesita internet para crearlo (se comprueba y, si no hay, el trabajo avisa de que lo crees desde el login con
+`bash setup_env/setup_hpc.sh`); `CREATE_ENV=0` desactiva la creación; `CONDA_ENV` puede ser un nombre o una ruta absoluta. El índice de torch (`TORCH_INDEX`) debe corresponder a la CUDA del módulo (11.8 → `cu118`).
+La creación suma varios minutos de descargas al tiempo del trabajo.
+
 ## Tubería completa con un trabajo por etapa (alternativa, desde el login)
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull && mkdir -p logs
