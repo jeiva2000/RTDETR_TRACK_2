@@ -174,5 +174,6 @@ rtdetrv2_pytorch/dataset/
 # RTDETR_TRACK_2
 setup_env/paths.local.env
 setup_env/paths.hpc.env
-logs/
+logs/*
+!logs/.gitkeep
 output/

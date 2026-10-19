@@ -50,7 +50,26 @@ bash tracking/scripts/aggregate_seeds.sh hpc e2e_h1 assoc_ema assoc_graph
 | `tracking/scripts/pipe_job.sh` | Envoltorio de SLURM (módulos GCC/12.2.0 y CUDA/11.8.0, conda, etapa). |
 | `tracking/scripts/e2e_pipeline.sh` | **Orquestador**: un solo comando para toda la tubería (SLURM con dependencias, o local repartiendo trabajos entre GPUs). |
 
-## Tubería completa en el servidor (un solo comando)
+## Entrenamiento en el servidor con UN solo `.slurm`: detector + e2e descongelado
+`slurm/e2e.slurm` sigue las convenciones de la plantilla del clúster (`--export=NONE`, `module purge`, comprobación de `nvcc`, `CUDA_HOME`, conda, diagnóstico en el log) y ejecuta,
+en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso):
+1. **Entrenamiento de RT-DETR** (1 clase; train = DanceTrack + CrowdHuman, val = DanceTrack val; solver con early stopping sobre el AP) → `$OUTPUT_ROOT/$DET_RUN_NAME/best.pth`.
+   Si ya está hecho (marcador `TRAINING_DONE`) se salta; si se cortó por tiempo, **se reanuda** desde `last.pth`. El lote total es el menor múltiplo del nº de GPUs ≥ 16 (RT-DETR exige que sea divisible por las GPUs; el `lr` no se reescala).
+2. **Cuando termina la 1**, entrenamiento **descongelado** del módulo e2e (decoder + módulo, `tracking/e2e/train_joint.py`) partiendo de ese `best.pth`; cada GPU procesa sus propios clips → `$OUTPUT_ROOT/$E2E_RUN_NAME/`.
+
+Por ahora **no** se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
+```bash
+cd ~/work/RTDETR_TRACK_2 && git pull                            # logs/ ya viene en el repo (Slurm la necesita antes de arrancar)
+cp setup_env/paths.hpc.env.example setup_env/paths.hpc.env      # rutas absolutas (si aún no existe)
+# edita en slurm/e2e.slurm: la cabecera #SBATCH (--partition, --gres, --nodelist, --cpus-per-task, --mem, -t) y el bloque CONFIGURACIÓN
+sbatch slurm/e2e.slurm
+```
+**Datos que deben estar preparados antes (Fase 2):** el COCO de train (`$COCO_DIR/detector_train/annotations/train.json`, mezcla de DanceTrack y CrowdHuman con `merge_coco.py`), el COCO de val
+(`$COCO_DIR/dancetrack/annotations/val.json`), DanceTrack en `$DANCETRACK_DIR` (`train1/ train2/ val/`) y el checkpoint COCO en `$CKPT_DIR`. El script lo comprueba al empezar y, si falta el checkpoint COCO,
+intenta descargarlo (los nodos de cómputo pueden no tener internet: descárgalo antes desde el login con `bash setup_env/download_ckpt.sh hpc`). Si el trabajo se corta en la etapa 2, al relanzarlo la etapa 1 se salta
+pero la 2 empieza de nuevo (el entrenamiento e2e no tiene reanudación). Con `sbatch --export=ALL,FORCE_DET=1 slurm/e2e.slurm` se reentrena el detector aunque exista.
+
+## Tubería completa con un trabajo por etapa (alternativa, desde el login)
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull && mkdir -p logs
 export DET_CKPT=/ruta/detector/best.pth FEAT_DIR=/ruta/features/detector_v1

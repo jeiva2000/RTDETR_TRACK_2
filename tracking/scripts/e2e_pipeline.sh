@@ -36,7 +36,7 @@ if [ "$MODE" = "slurm" ]; then
   FAKE_FILE=$(mktemp); echo 100 > "$FAKE_FILE"
   submit() {   # submit <nombre> <tiempo> <gpu:1|0> <dependencias> <etapa y args...> -> imprime el id del trabajo
     local name="$1" tm="$2" gpu="$3" dep="$4"; shift 4
-    local opts=(--parsable --job-name="$name" --time="$tm" --cpus-per-task=$((8 * (gpu > 1 ? gpu : 1))) --mem=$((48 * (gpu > 1 ? gpu : 1)))G --output="logs/%x_%j.out" --error="logs/%x_%j.err" --export=ALL)
+    local opts=(--parsable --job-name="$name" --time="$tm" --nodes=1 --ntasks-per-node=1 --cpus-per-task=$((8 * (gpu > 1 ? gpu : 1))) --mem=$((48 * (gpu > 1 ? gpu : 1)))G --output="logs/%x_%j.out" --error="logs/%x_%j.err" --export=ALL)
     # gpu = nº de GPUs del trabajo (0 = ninguna). SBATCH_GPU_TEMPLATE con %N (p. ej. "--gres=gpu:a100:%N") o, por defecto, --gres=gpu:N
     [ "$gpu" -ge 1 ] && opts+=($(echo "${SBATCH_GPU_TEMPLATE:---gres=gpu:%N}" | sed "s/%N/$gpu/"))
     [ -n "${SBATCH_COMMON:-}" ] && opts+=($SBATCH_COMMON)
