@@ -82,6 +82,7 @@ def run_batch(model, batch, cfg, device, train, ss):
     loss = cfg.loss.w_assoc * sa / max(na, 1) + cfg.loss.w_birth * sb / max(nb, 1) + cfg.loss.w_motion * sm / max(nm, 1)
     f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)
     st.update(assoc_sum=f(sa), birth_sum=f(sb), n_birth=nb, motion_sum=f(sm), n_motion=nm)
+    st['parts'] = dict(assoc=f(sa) / max(na, 1), birth=f(sb) / max(nb, 1), motion=f(sm) / max(nm, 1))   # las tres partes de la pérdida, sin ponderar
     return loss, st
 
 
@@ -126,13 +127,17 @@ def main(a):
         train_ds.seed = a.seed + ep
         order = list(range(len(train_ds))); random.shuffle(order)
         t0, run_loss, nb = time.time(), 0.0, 0
+        run_parts = dict(assoc=0.0, birth=0.0, motion=0.0)
         for b in range(0, len(order), T.batch):
-            loss, _ = run_batch(model, collate([train_ds[i] for i in order[b:b + T.batch]]), cfg, dev, True, ss)
+            loss, st_b = run_batch(model, collate([train_ds[i] for i in order[b:b + T.batch]]), cfg, dev, True, ss)
+            for k in run_parts:
+                run_parts[k] += st_b['parts'][k]
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), T.clip_grad)
             opt.step(); run_loss += float(loss); nb += 1
         v = evaluate(model, val_ds, cfg, dev)
-        log = dict(epoch=ep, ss=ss, train_loss=run_loss / max(nb, 1), **{f'val_{k}': x for k, x in v.items()}, time=time.time() - t0)
+        parts = {f'train_{k}': x / max(nb, 1) for k, x in run_parts.items() if k != 'motion' or cfg.motion.mode != 'none'}   # motion solo con H2
+        log = dict(epoch=ep, ss=ss, train_loss=run_loss / max(nb, 1), **parts, **{f'val_{k}': x for k, x in v.items()}, time=time.time() - t0)
         print(json.dumps(log), flush=True)
         open(os.path.join(a.out, 'log.txt'), 'a').write(json.dumps(log) + '\n')
         state = dict(model=model.state_dict(), cfg=dict(cfg), in_dim=in_dim, epoch=ep, val=v)

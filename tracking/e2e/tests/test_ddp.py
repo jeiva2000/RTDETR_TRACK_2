@@ -84,6 +84,11 @@ def test_ddp_two_processes_cpu(extra_ov=()):
                 assert float(line.split()[-1]) < 1e-5, line
         recs = [json.loads(l) for l in open(tmp + '/run/log.txt')]
         assert len(recs) == 2 and all(np.isfinite(x['train_det']) and np.isfinite(x['train_e2e']) for x in recs)
+        motion = any('motion.mode=gru' in o for o in extra_ov)
+        for x in recs:   # el e2e se registra también por partes (sin ponderar); la de movimiento solo existe en H2
+            assert all(np.isfinite(x[k]) and x[k] >= 0 for k in ('train_assoc', 'train_birth')), x
+            assert ('train_motion' in x) == motion and ('val_motion_nll' in x) == motion and np.isfinite(x['val_birth_loss']), x
+        assert 'assoc ' in r.stdout and 'birth ' in r.stdout and (('motion ' in r.stdout) == motion), 'las líneas de paso deben mostrar las partes'
         assert os.path.isfile(tmp + '/run/e2e_last.pth') and os.path.isfile(tmp + '/run/detector_last.pth')
 
 

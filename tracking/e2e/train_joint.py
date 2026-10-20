@@ -48,8 +48,9 @@ class JointModule(torch.nn.Module):
         tid, _ = match_queries(self.det.criterion.matcher, q, gts, dev, self.min_iou)
         ebatch = dict(emb=q['emb'].view(B, T, K, -1), boxes=q['boxes'].detach().view(B, T, K, 4), scores=q['scores'].detach().view(B, T, K),
                       tid=tid.view(B, T, K).to(dev), frames=frames, cross=[None] * B)
-        loss_e2e, _ = run_batch(self.e2e, ebatch, self.cfg, dev, True, ss)
-        return loss_det + self.lam * loss_e2e, loss_det.detach(), loss_e2e.detach(), {k: float(v) for k, v in loss_dict.items()}
+        loss_e2e, st = run_batch(self.e2e, ebatch, self.cfg, dev, True, ss)
+        return (loss_det + self.lam * loss_e2e, loss_det.detach(), loss_e2e.detach(), {k: float(v) for k, v in loss_dict.items()},
+                st['parts'])      # partes de la pérdida e2e (asociación, nacimiento, movimiento) sin ponderar, para el log
 
 
 def control_value(d, metric):
@@ -153,11 +154,11 @@ def main(a):
             sampler.set_epoch(ep)             # cada época reparte los clips de otra forma, sin solaparse entre procesos
         dl = torch.utils.data.DataLoader(train_ds, batch_size=B, shuffle=(sampler is None), sampler=sampler, num_workers=a.num_workers,
                                          collate_fn=collate_images, drop_last=True)
-        run, t0 = dict(det=0.0, e2e=0.0, n=0), time.time()
+        run, t0 = dict(det=0.0, e2e=0.0, assoc=0.0, birth=0.0, motion=0.0, n=0), time.time()
         for batch in dl:
             images = batch['images'].flatten(0, 1).to(dev)
             gts = [g for g_clip in batch['gts'] for g in g_clip]
-            loss, loss_det, loss_e2e, loss_dict = joint_ddp(images, gts, batch['frames'], ss_ep, ep, step)
+            loss, loss_det, loss_e2e, loss_dict, parts = joint_ddp(images, gts, batch['frames'], ss_ep, ep, step)
             f = min(1.0, (step + 1) / max(a.warmup_steps, 1))
             f_det = 0.0 if step < det_freeze else min(1.0, (step - det_freeze + 1) / max(a.warmup_steps, 1))
             for g in opt.param_groups:
@@ -171,18 +172,23 @@ def main(a):
             if not torch.isfinite(loss):
                 print(f'[rank {rank}] pérdida no finita; se detiene', loss_dict, float(loss_e2e), flush=True); sys.exit(1)   # torchrun termina el resto de procesos
             run['det'] += float(loss_det); run['e2e'] += float(loss_e2e); run['n'] += 1; step += 1
+            for k in ('assoc', 'birth', 'motion'):
+                run[k] += parts[k]
             if step % a.print_freq == 0 and main_proc:
-                print(f'ep {ep} step {step} det {float(loss_det):.3f} e2e {float(loss_e2e):.3f} lr_dec {opt.param_groups[0]["lr"]:.2e} '
-                      f'{(time.time() - t0) / run["n"]:.2f}s/it', flush=True)
+                mot = f' motion {parts["motion"]:.3f}' if cfg.motion.mode != 'none' else ''
+                print(f'ep {ep} step {step} det {float(loss_det):.3f} e2e {float(loss_e2e):.3f} (assoc {parts["assoc"]:.3f} birth {parts["birth"]:.3f}{mot}) '
+                      f'lr_dec {opt.param_groups[0]["lr"]:.2e} {(time.time() - t0) / run["n"]:.2f}s/it', flush=True)
         with torch.no_grad():
             d = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
                           num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs, dist=du)
         v = eval_live()
         cv = control_value(d, a.deta_metric)
         ok = bool(du.broadcast_object(cv >= c0 - a.deta_tol))     # la decisión de parar la toma rank 0 y es la misma en todos: si no, unos procesos salen del bucle y otros siguen (DDP se bloquea)
-        rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), DetA=d['DetA'], DetA_control=cv,
+        parts = {f'train_{k}': run[k] / max(run['n'], 1) for k in ('assoc', 'birth', 'motion') if k != 'motion' or cfg.motion.mode != 'none'}   # e2e sin ponderar, por partes
+        vparts = dict(val_birth_loss=v['birth_loss'], **(dict(val_motion_nll=v['motion_nll']) if cfg.motion.mode != 'none' else {}))
+        rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), **parts, DetA=d['DetA'], DetA_control=cv,
                    DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), n_det=d['n_det'],
-                   val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], deta_ok=bool(ok), time=time.time() - t0)
+                   val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], **vparts, deta_ok=bool(ok), time=time.time() - t0)
         P(json.dumps(rec), flush=True)
         if a.check_sync and world > 1:      # las réplicas deben seguir idénticas tras el paso del optimizador
             sums = du.all_gather_object(du.params_checksum(joint))
