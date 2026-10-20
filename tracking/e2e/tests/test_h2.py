@@ -147,6 +147,27 @@ def test_predictor_learns_constant_velocity():
     assert z_true < 2.0 and z_off > 2 * z_true, f'z real {float(z_true):.2f} vs desplazada {float(z_off):.2f}'
 
 
+def test_match_queries_accepts_gts_on_another_device():
+    """Regresión (DDP en GPU): DistributedDataParallel.forward mueve a la GPU todos los tensores de sus argumentos, incluida la lista de gts, que
+    llegaba a match_queries en CUDA mientras tid se construye en CPU. Se reproduce con MPS/CUDA si hay; sin acelerador no hay nada que comprobar."""
+    from tracking.video.extractor import match_queries
+    dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else None)
+    if dev is None:
+        print('     (sin acelerador: no aplica)'); return
+
+    class Matcher:        # como el HungarianMatcher de RT-DETR: índices en CPU
+        def __call__(self, out, targets):
+            return dict(indices=[(torch.tensor([0, 2]), torch.tensor([0, 1])) for _ in targets])
+
+    boxes = torch.tensor([[0.3, 0.3, 0.2, 0.4], [0.9, 0.9, 0.05, 0.05], [0.7, 0.6, 0.2, 0.4]])
+    q = dict(scores=torch.ones(1, 3), logits=torch.zeros(1, 3, 1), boxes=boxes[None])
+    gts = [torch.tensor([[7.0, 0.3, 0.3, 0.2, 0.4], [9.0, 0.7, 0.6, 0.2, 0.4]])]     # id, cx, cy, w, h
+    tid_ref, _ = match_queries(Matcher(), q, gts, 'cpu', 0.5)
+    q_dev = {k: v.to(dev) for k, v in q.items()}                  # como en el entrenamiento: salidas del modelo y gts en la GPU
+    tid, _ = match_queries(Matcher(), q_dev, [g.to(dev) for g in gts], dev, 0.5)
+    assert tid.device.type == 'cpu' and tid.tolist() == tid_ref.tolist() == [[7, -1, 9]]
+
+
 def test_smoke_train_and_infer_with_motion():
     """Entrenamiento corto + inferencia con motion.mode=gru sobre una caché sintética (CPU): pérdidas finitas y checkpoint reutilizable."""
     from tracking.tools.make_synthetic import make

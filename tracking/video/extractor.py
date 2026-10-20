@@ -40,7 +40,7 @@ def match_queries(matcher, q, gts, device, min_iou=0.0):
     for b, (src, tgt) in zip(nonempty, idx):
         ious = box_iou(box_cxcywh_to_xyxy(q['boxes'][b, src].detach().float()), box_cxcywh_to_xyxy(targets[b]['boxes'][tgt]))[0].diag().cpu()
         keep = ious >= min_iou
-        tid[b, src[keep]] = gts[b][tgt[keep], 0].long()
+        tid[b, src[keep]] = gts[b][tgt[keep], 0].long().cpu()   # gts puede venir en GPU (DDP mueve a la GPU los tensores de los argumentos); tid está en CPU
         miou[b, src[keep]] = ious[keep]
     return tid, miou
 
