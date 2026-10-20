@@ -16,8 +16,9 @@
 #   1. ENTRENAMIENTO DE RT-DETR (detección de personas, 1 clase; train = DanceTrack + CrowdHuman, val = DanceTrack val; solver con early stopping sobre el AP de val)
 #      -> $OUTPUT_ROOT/$DET_RUN_NAME/best.pth     (checkpoint de detección). Se salta si ya existe el checkpoint final (marcador, best.pth sin last.pth, o DET_CKPT_EXTERNAL=<ruta>); si se cortó por tiempo, se REANUDA desde last.pth.
 #   2. cuando la 1 termina: ENTRENAMIENTO DESCONGELADO del módulo e2e (decoder + módulo, tracking/e2e/train_joint.py) partiendo de ese best.pth; cada GPU procesa sus propios clips.
-#      -> $OUTPUT_ROOT/$E2E_RUN_NAME/   (detector_best/last.pth, e2e_best/last.pth, log.txt). Variante por defecto: h2 (H2, GRU de movimiento);
-#         E2E_VARIANT=h1 para el H1, o cualquiera de tracking/configs/e2e_variants.sh (h2_w01, h2_m64, ...). La carpeta es e2e_unfrozen_<variante>.
+#      Se entrenan SECUENCIALMENTE las variantes de E2E_RUN_VARIANTS (por defecto "h1 h2": H1 = solo apariencia, H2 = + GRU de movimiento), cada una desde el mismo detector
+#      -> $OUTPUT_ROOT/e2e_unfrozen_<variante>/   (detector_best/last.pth, e2e_best/last.pth, log.txt, marcador TRAINING_DONE). Una variante terminada se salta al relanzar (FORCE_E2E=1 la repite);
+#         si una falla, las demás se ejecutan igualmente y el trabajo termina con error al final. Otras variantes: tracking/configs/e2e_variants.sh (h2_w01, h2_m64, ...).
 # POR AHORA no se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen en tracking/scripts/e2e_pipeline.sh).
 #
 # USO (sin variables ni pasos previos), desde la RAÍZ del repo (logs/ ya viene en el repo; Slurm la necesita antes de arrancar):
@@ -49,8 +50,9 @@ DET_NUM_WORKERS="${DET_NUM_WORKERS:-4}"                 # workers del dataloader
 FORCE_DET="${FORCE_DET:-0}"                             # 1 = reentrenar el detector aunque ya exista
 DET_CKPT_EXTERNAL="${DET_CKPT_EXTERNAL:-}"              # ruta a un best.pth de detección ya entrenado (de otra carpeta/ejecución): se usa tal cual y NO se entrena el detector
 # --- Etapa 2: entrenamiento descongelado del módulo e2e (DDP) ---
-E2E_VARIANT="${E2E_VARIANT:-h2}"                        # variante de tracking/configs/e2e_variants.sh: h2 = H2 (GRU de movimiento, segundo vector por track); h1 = H1 (solo apariencia)
-E2E_RUN_NAME="${E2E_RUN_NAME:-e2e_unfrozen_$E2E_VARIANT}"   # carpeta de salida en $OUTPUT_ROOT (lleva la variante: no pisa ejecuciones de otra variante)
+E2E_RUN_VARIANTS="${E2E_RUN_VARIANTS:-${E2E_VARIANT:-h1 h2}}"   # variantes de tracking/configs/e2e_variants.sh que se entrenan, EN ESTE ORDEN y una tras otra (h1 = solo apariencia; h2 = + GRU de movimiento). E2E_VARIANT=<una> sigue valiendo para una sola
+E2E_RUN_PREFIX="${E2E_RUN_PREFIX:-e2e_unfrozen}"        # carpeta de cada variante en $OUTPUT_ROOT: <prefijo>_<variante>
+FORCE_E2E="${FORCE_E2E:-0}"                             # 1 = reentrenar también las variantes que ya terminaron (marcador TRAINING_DONE)
 LAMBDA="${LAMBDA:-10}"                                  # peso de la pérdida e2e frente a la de detección (sin ajustar; 0 = solo se ajusta el detector)
 CLIPS_PER_GPU="${CLIPS_PER_GPU:-1}"                     # clips por GPU y paso (lote efectivo = clips por GPU x nº de GPUs)
 JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs)
@@ -146,7 +148,6 @@ NGPU="${SLURM_GPUS_ON_NODE:-$(python -c 'import torch; print(torch.cuda.device_c
 [ "$NGPU" -ge 1 ] || { echo "ERROR: no hay GPUs visibles" >&2; exit 1; }
 [ -n "$DET_BATCH" ] || DET_BATCH=$(( (16 + NGPU - 1) / NGPU * NGPU ))
 DET_OUT="$OUTPUT_ROOT/$DET_RUN_NAME"; DET_CKPT="$DET_OUT/best.pth"; DET_DONE="$DET_OUT/TRAINING_DONE"
-E2E_OUT="$OUTPUT_ROOT/$E2E_RUN_NAME"
 
 # --- ¿Hay ya un detector entrenado? (decide si se salta la etapa 1; con DET_SKIP=1 la etapa 0 solo prepara DanceTrack) ---
 det_finished() {   # el entrenamiento de $DET_OUT terminó: llegó a DET_EPOCHS o paró por early stopping (log.txt + early_stop.json del solver)
@@ -177,7 +178,7 @@ elif [ -f "$DET_CKPT" ]; then
 elif [ -f "$DET_DONE" ]; then
   echo "[detector] AVISO: existe el marcador $DET_DONE pero no $DET_CKPT: se reentrena"
 fi
-echo "Job $SLURM_JOB_ID en $(hostname): $NGPU GPU(s) | detector: $DET_CKPT (lote total $DET_BATCH, saltar entrenamiento: $DET_SKIP) | e2e: $E2E_OUT"
+echo "Job $SLURM_JOB_ID en $(hostname): $NGPU GPU(s) | detector: $DET_CKPT (lote total $DET_BATCH, saltar entrenamiento: $DET_SKIP) | e2e: $E2E_RUN_VARIANTS en $OUTPUT_ROOT/${E2E_RUN_PREFIX}_<variante>"
 #export OMP_NUM_THREADS=1
 
 need() { [ -e "$1" ] || { echo "ERROR: falta $1 ($2)" >&2; exit 1; }; }
@@ -278,16 +279,35 @@ else
   echo "[etapa 1] terminada: $DET_CKPT"
 fi
 
-# ============================== ETAPA 2: entrenamiento descongelado del módulo e2e (DDP) ==============================
+# ============================== ETAPA 2: entrenamiento descongelado del módulo e2e (DDP), una variante tras otra ==============================
 source tracking/configs/e2e_variants.sh
-OV=""; FOUND=0
-for v in "${E2E_VARIANTS[@]}"; do [ "${v%%|*}" = "$E2E_VARIANT" ] && { OV=$(echo "${v#*|}" | sed 's/#.*//'); FOUND=1; }; done
-[ "$FOUND" = "1" ] || { echo "ERROR: variante desconocida: $E2E_VARIANT (ver tracking/configs/e2e_variants.sh)" >&2; exit 1; }
-mkdir -p "$E2E_OUT"
-MASTER_PORT=$((10000 + RANDOM % 20000))
-echo "[etapa 2] e2e descongelado con $NGPU GPU(s), $CLIPS_PER_GPU clip(s) por GPU (lote efectivo $((CLIPS_PER_GPU * NGPU))); variante $E2E_VARIANT, lambda $LAMBDA"
-# shellcheck disable=SC2086
-torchrun --master_port="$MASTER_PORT" --nproc_per_node="$NGPU" \
-    -m tracking.e2e.train_joint --det-ckpt "$DET_CKPT" --out "$E2E_OUT" --seed "$SEED" --lambda-e2e "$LAMBDA" \
-    --clips-per-gpu "$CLIPS_PER_GPU" ${JOINT_ARGS:-} ${OV:+-u $OV}
-echo "[etapa 2] terminada: $E2E_OUT"
+overrides_of() {   # overrides de una variante de e2e_variants.sh; falla si no existe
+  local v
+  for v in "${E2E_VARIANTS[@]}"; do [ "${v%%|*}" = "$1" ] && { echo "${v#*|}" | sed 's/#.*//'; return 0; }; done
+  echo "ERROR: variante desconocida: $1 (ver tracking/configs/e2e_variants.sh)" >&2; return 1
+}
+for V in $E2E_RUN_VARIANTS; do overrides_of "$V" >/dev/null || exit 1; done     # se comprueban todas antes de empezar a entrenar
+echo "[etapa 2] variantes en orden: $E2E_RUN_VARIANTS | $NGPU GPU(s), $CLIPS_PER_GPU clip(s) por GPU (lote efectivo $((CLIPS_PER_GPU * NGPU))), lambda $LAMBDA"
+FAILED=(); DONE_NOW=(); SKIPPED=()
+for V in $E2E_RUN_VARIANTS; do
+  OV=$(overrides_of "$V"); E2E_OUT="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V"
+  if [ -f "$E2E_OUT/TRAINING_DONE" ] && [ "$FORCE_E2E" != "1" ]; then
+    echo "[etapa 2:$V] ya entrenada ($E2E_OUT/TRAINING_DONE): se salta"; SKIPPED+=("$V"); continue
+  fi
+  if [ -e "$E2E_OUT" ]; then   # el entrenamiento e2e no tiene reanudación: una ejecución a medias se aparta (no se borra) y se empieza de cero
+    mv "$E2E_OUT" "${E2E_OUT}_previo_$SLURM_JOB_ID"; echo "[etapa 2:$V] AVISO: había una ejecución sin terminar; se aparta en ${E2E_OUT}_previo_$SLURM_JOB_ID"
+  fi
+  mkdir -p "$E2E_OUT"
+  MASTER_PORT=$((10000 + RANDOM % 20000))
+  echo "[etapa 2:$V] $(date '+%F %T') entrenando (overrides: ${OV:-ninguno}) -> $E2E_OUT"
+  # shellcheck disable=SC2086
+  if torchrun --master_port="$MASTER_PORT" --nproc_per_node="$NGPU" \
+      -m tracking.e2e.train_joint --det-ckpt "$DET_CKPT" --out "$E2E_OUT" --seed "$SEED" --lambda-e2e "$LAMBDA" \
+      --clips-per-gpu "$CLIPS_PER_GPU" ${JOINT_ARGS:-} ${OV:+-u $OV}; then
+    date '+%Y-%m-%dT%H:%M:%S' > "$E2E_OUT/TRAINING_DONE"; DONE_NOW+=("$V"); echo "[etapa 2:$V] terminada: $E2E_OUT"
+  else
+    RC=$?; FAILED+=("$V"); echo "[etapa 2:$V] ERROR: el entrenamiento falló (código $RC); se continúa con la siguiente variante" >&2
+  fi
+done
+echo "[etapa 2] resumen: entrenadas=[${DONE_NOW[*]:-}] saltadas=[${SKIPPED[*]:-}] fallidas=[${FAILED[*]:-}]"
+[ "${#FAILED[@]}" -eq 0 ] || exit 1

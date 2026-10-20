@@ -78,8 +78,12 @@ en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso
    **Cuándo se salta** (el `.slurm` lo decide al empezar y lo imprime con el prefijo `[detector]`): con `DET_CKPT_EXTERNAL=<ruta/best.pth>` (se usa ese checkpoint tal cual, de otra carpeta o ejecución); o si existe `$DET_RUN_NAME/best.pth` y hay marcador `TRAINING_DONE`;
    o si hay `best.pth` **sin `last.pth`** (un entrenamiento en curso siempre tiene `last.pth`, así que es un checkpoint final copiado o importado); o si hay `last.pth` pero el entrenamiento ya terminó (llegó a `DET_EPOCHS` o paró por early stopping, según `log.txt` y `early_stop.json`; se crea el marcador).
    Si el entrenamiento **no** terminó, **se reanuda** desde `last.pth`. Si hay marcador pero falta `best.pth`, se avisa y se reentrena. `FORCE_DET=1` reentrena siempre. Cuando se salta, la etapa 0 solo prepara DanceTrack (no descarga CrowdHuman ni rehace los COCO). El lote total es el menor múltiplo del nº de GPUs ≥ 16 (RT-DETR exige que sea divisible por las GPUs; el `lr` no se reescala).
-2. **Cuando termina la 1**, entrenamiento **descongelado** del módulo e2e (decoder + módulo, `tracking/e2e/train_joint.py`) partiendo de ese `best.pth`; cada GPU procesa sus propios clips → `$OUTPUT_ROOT/$E2E_RUN_NAME/` (por defecto `e2e_unfrozen_<variante>`).
-   La variante por defecto es **`h2`** (GRU de movimiento); cámbiala con `sbatch --export=ALL,E2E_VARIANT=h1 slurm/e2e.slurm` (o `h2_w01`, `h2_m64`, …, de `tracking/configs/e2e_variants.sh`).
+2. **Cuando termina la 1**, entrenamiento **descongelado** del módulo e2e (decoder + módulo, `tracking/e2e/train_joint.py`) partiendo de ese `best.pth`; cada GPU procesa sus propios clips.
+   Se entrenan **de forma secuencial** las variantes de `E2E_RUN_VARIANTS` (por defecto **`h1 h2`**: H1 = solo apariencia, H2 = + GRU de movimiento), ambas desde el mismo detector, cada una en
+   `$OUTPUT_ROOT/e2e_unfrozen_<variante>/` (`E2E_RUN_PREFIX` cambia el prefijo). Todas las variantes se validan antes de empezar. Cada una deja un marcador `TRAINING_DONE`: al relanzar se **salta** la que ya terminó
+   (`FORCE_E2E=1` la repite) y una ejecución a medias se aparta como `<carpeta>_previo_<jobid>` (el entrenamiento e2e no tiene reanudación). Si una variante **falla**, las demás se ejecutan igualmente y el trabajo
+   termina con error al final (el resumen lista entrenadas / saltadas / fallidas). Elegir otras: `sbatch --export=ALL,E2E_RUN_VARIANTS="h2 h2_w01" slurm/e2e.slurm`; una sola: `E2E_RUN_VARIANTS=h2` (o `E2E_VARIANT=h2`).
+   El tiempo es la suma de las variantes: ajusta `-t` de la cabecera `#SBATCH` (aún sin medir).
 Por ahora **no** se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull                            # logs/ ya viene en el repo (Slurm la necesita antes de arrancar)
