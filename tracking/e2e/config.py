@@ -9,7 +9,8 @@ DEFAULTS = {
     'state': {'max_tracks': 64, 'max_age': 30},                      # max_age en frames del vídeo (no en pasos)
     'heads': {'dim': 256, 'hidden': 256, 'tau_init': 2.3},
     'appearance': {'mode': 'ema', 'alpha_app': 0.1},                 # H1: EMA fija (equivale a assoc 'ema' con alpha 0.9)
-    'loss': {'w_assoc': 1.0, 'w_birth': 1.0, 'birth_pos_weight': 1.0, 'birth_detach': True},   # birth_detach: el gradiente del nacimiento no llega a la proyección compartida
+    'motion': {'mode': 'none', 'dim': 128, 'hidden': 128, 'vel_scale': 10.0},   # H2: mode none | gru (segundo vector por track con σ)
+    'loss': {'w_assoc': 1.0, 'w_birth': 1.0, 'w_motion': 1.0, 'birth_pos_weight': 1.0, 'birth_detach': True},   # birth_detach: el gradiente del nacimiento no llega a la proyección compartida
     'train': {'T': 10, 'burn_in': 0, 'ss_max': 0.5, 'ss_warmup': 5, 'p_fn': 0.1, 'lr': 1e-3, 'weight_decay': 1e-4,
               'epochs': 20, 'batch': 8, 'samples_per_epoch': 2000, 'val_samples': 300, 'clip_grad': 1.0,
               'max_stride': 3, 'p_skip': 0.2, 'max_skip': 5},

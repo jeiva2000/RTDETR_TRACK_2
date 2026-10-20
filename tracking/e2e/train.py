@@ -2,6 +2,7 @@
 comparación sea limpia: clips de T frames con stride y saltos aleatorios (clips.py), BPTT sobre el clip, scheduled sampling con rampa,
 falsos negativos inyectados y muerte tras max_age. Diferencias: estado en tensores con padding + máscaras (lote de clips en paralelo) y
 cabeza de nacimiento con BCE aparte (D1).
+H2 (motion.mode=gru): se añade la NLL gaussiana del movimiento (loss.w_motion) sobre los tracks presentes.
 Uso: python -m tracking.e2e.train --cfg tracking/configs/e2e.yml --train-cache <dir> --val-cache <dir> --out <dir> [-u train.lr=1e-3 ...]"""
 import argparse, json, os, random, sys, time
 import numpy as np
@@ -11,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from tracking.e2e.config import load_config
 from tracking.e2e.losses import IGNORE, assoc_loss, birth_loss
 from tracking.e2e.model import E2EModel
-from tracking.e2e.state import TrackState
+from tracking.e2e.motion import box_delta, motion_loss
 from tracking.e2e.tokens import from_cache
 from tracking.video.clips import CachedClipDataset
 
@@ -28,8 +29,8 @@ def run_batch(model, batch, cfg, device, train, ss):
     tid, frames = batch['tid'].to(device), batch['frames'].to(device)
     B, T, K, _ = emb.shape
     W = cfg.train.burn_in
-    state = TrackState.empty(B, cfg.state.max_tracks, cfg.heads.dim, device)
-    sa, na, sb, nb = 0.0, 0, 0.0, 0
+    state = model.new_state(B, device)
+    sa, na, sb, nb, sm, nm = 0.0, 0, 0.0, 0, 0.0, 0
     st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0)
     for t in range(T):
         frame = frames[:, t]
@@ -39,7 +40,8 @@ def run_batch(model, batch, cfg, device, train, ss):
             dets = dets.drop((tid_t >= 0) & (torch.rand(B, K, device=device) < cfg.train.p_fn))
         bi = t < W                          # burn-in: llena el estado sin gradiente ni pérdida
         with torch.no_grad() if bi else torch.enable_grad():
-            logits, birth_logit, enc = model.scores(state, dets, frame)
+            pred = model.predict_motion(state, frame)
+            logits, birth_logit, enc = model.scores(state, dets, frame, pred)
             alive = state.alive
             eq = (tid_t[:, None, :] == state.ids[:, :, None]) & dets.valid[:, None, :] & (state.ids[:, :, None] >= 0)
             target = torch.where(eq.any(-1), eq.float().argmax(-1), torch.full_like(state.ids, K))
@@ -49,6 +51,11 @@ def run_batch(model, batch, cfg, device, train, ss):
         if not bi:
             la, n_a = assoc_loss(logits, tgt_l)
             sa, na = sa + la, na + int(n_a)
+            if pred is not None:   # NLL del movimiento sobre los tracks cuya detección está presente (estado previo a la actualización)
+                pres_m = alive & (target < K)
+                obox = torch.gather(dets.box, 1, target.clamp(max=K - 1)[..., None].expand(-1, -1, 4))
+                lm, n_m = motion_loss(pred[0], pred[1], box_delta(state.box, obox), pres_m)
+                sm, nm = sm + lm, nm + int(n_m)
             ok = (assign == target) & alive
             st['n'] += int(alive.sum()); st['ok'] += int(ok.sum())
             pres = alive & (target < K)
@@ -72,15 +79,15 @@ def run_batch(model, batch, cfg, device, train, ss):
                 if len(js):
                     state, made = state.spawn(b, tid_t[b, js], model.init_state_vec(dets.emb[b, js]), dets.box[b, js], frame[b])
                     st['overflow'] += len(js) - made
-    loss = cfg.loss.w_assoc * sa / max(na, 1) + cfg.loss.w_birth * sb / max(nb, 1)
+    loss = cfg.loss.w_assoc * sa / max(na, 1) + cfg.loss.w_birth * sb / max(nb, 1) + cfg.loss.w_motion * sm / max(nm, 1)
     f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)
-    st.update(assoc_sum=f(sa), birth_sum=f(sb), n_birth=nb)
+    st.update(assoc_sum=f(sa), birth_sum=f(sb), n_birth=nb, motion_sum=f(sm), n_motion=nm)
     return loss, st
 
 
 def evaluate(model, ds, cfg, device):
     model.eval()
-    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0)
+    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, motion_sum=0.0, n_motion=0)
     bs = cfg.train.batch
     with torch.no_grad():
         for i in range(0, len(ds), bs):
@@ -90,6 +97,8 @@ def evaluate(model, ds, cfg, device):
     model.train()
     out = dict(loss=tot['assoc_sum'] / max(tot['n'], 1), acc=tot['ok'] / max(tot['n'], 1),
                acc_present=tot['ok_present'] / max(tot['present'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1))
+    if tot['n_motion']:
+        out['motion_nll'] = tot['motion_sum'] / tot['n_motion']
     if tot['cross']:
         out['acc_cross'] = tot['ok_cross'] / tot['cross']
     if tot['overflow']:
@@ -107,7 +116,7 @@ def main(a):
     val_ds = CachedClipDataset(a.val_cache, None, samples_per_epoch=T.val_samples, seed=12345, **kw)
     in_dim = train_ds.data[train_ds.seqs[0]]['emb'].shape[-1]
     model = E2EModel(cfg, in_dim).to(dev)
-    print(f'E2EModel H1: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parámetros', flush=True)
+    print(f'E2EModel (motion={cfg.motion.mode}): {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parámetros', flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=T.lr, weight_decay=T.weight_decay)
     os.makedirs(a.out, exist_ok=True)
     json.dump(dict(cfg=cfg, seed=a.seed), open(os.path.join(a.out, 'args.json'), 'w'), indent=1)

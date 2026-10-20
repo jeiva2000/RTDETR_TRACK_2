@@ -1,7 +1,7 @@
 # Módulo de tracking e2e (`tracking/e2e/`)
 
 Módulo de tracking construido **por hitos** sobre lo que ya existe en `tracking/` (extracción de queries, clips, caché, TrackEval, cruces, tablas con
-semillas, SLURM). No modifica `rtdetrv2_pytorch/src/`. `tracking/assoc/` se conserva como referencia para comparar. Estado: **H1** implementado.
+semillas, SLURM). No modifica `rtdetrv2_pytorch/src/`. `tracking/assoc/` se conserva como referencia para comparar. Estado: **H1** y **H2** implementados.
 
 ## Hito H1: tracker mínimo (detector congelado, caché)
 Estado por track: apariencia `a` (nace de la query de su primera detección), caja y último frame visto. Afinidad track×detección = temperatura·coseno + rama
@@ -19,6 +19,7 @@ Misma receta de entrenamiento que `tracking/assoc/train.py` (clips con stride y 
 | `model.py` | `E2EModel`: `scores`, `decide` (Hungarian global o teacher forcing), `update` (EMA con/sin match). |
 | `train.py` | Entrenamiento sobre la caché; guarda `best.pth` (mejor `val_acc` con decisiones propias) y `last.pth`. |
 | `infer.py` | Inferencia frame a frame sobre la caché de val → MOT. Nacimientos: sin asignar, prob. de nacimiento y score mínimos, NMS. |
+| `motion.py` | **H2**: `MotionHead` (GRU + predictor con σ), `motion_features`, `motion_loss`. Ver la sección del H2. |
 | `tests/test_h1.py` | 8 tests (formas, relleno, actualización con/sin match, estado, asignación exclusiva, desactivación por config, humo). |
 
 ### Claves de configuración (`tracking/configs/e2e.yml`; defaults en `config.py`)
@@ -50,13 +51,35 @@ bash tracking/scripts/aggregate_seeds.sh hpc e2e_h1 assoc_ema assoc_graph
 | `tracking/scripts/pipe_job.sh` | Envoltorio de SLURM (módulos GCC/12.2.0 y CUDA/11.8.0, conda, etapa). |
 | `tracking/scripts/e2e_pipeline.sh` | **Orquestador**: un solo comando para toda la tubería (SLURM con dependencias, o local repartiendo trabajos entre GPUs). |
 
+## Hito H2: predictor de movimiento (segundo vector por track)
+Con `motion.mode=gru` cada track lleva **dos vectores**: la apariencia `a` (EMA, como en H1) y el movimiento `m` (estado oculto de un GRU, `motion.dim`=128).
+Con `motion.mode=none` (por defecto) el modelo es **exactamente el H1**: mismos parámetros, `state.m=None`, checkpoints del H1 compatibles.
+- **Movimiento = delta de caja respecto a la última caja observada**, normalizado por su tamaño: `(dx/w, dy/h, log w'/w, log h'/h)`. Es la misma parametrización que la rama geométrica del H1.
+- **Actualización (`MotionHead.observe`)**: el GRU recibe `[delta/dt, delta, dt/10]` **solo con match**; sin match `m` no cambia y el hueco (`gap`) crece. Un track nuevo parte con `m = 0`.
+- **Predicción (`MotionHead.predict`)**: `(m, gap)` → media `mu` y `log σ` del delta para el frame actual (el `gap` entra como entrada: sirve con saltos y tras oclusiones). `log σ` en [-4, 1].
+- **Uso en la afinidad**: a la rama geométrica se añaden, por par track×detección, `z = (observado - mu)/σ`, la NLL gaussiana y el IoU con la caja predicha (6 rasgos); la columna nula recibe además `m` y el `log σ` medio
+  (un track con mucha incertidumbre tiene más probabilidad de "no aparecer"). La afinidad de apariencia no cambia.
+- **Pérdida**: `loss.w_motion` × NLL gaussiana del delta de la detección con el **mismo ID**, sobre los tracks presentes y con el estado previo a la actualización (las cajas del objetivo están desconectadas del grafo).
+  Se registra como `val_motion_nll`. Con DDP/descongelado funciona igual (cero conectado al grafo si no hay tracks presentes).
+- **Claves**: `motion.{mode,dim,hidden,vel_scale}` y `loss.w_motion`. Variantes en `e2e_variants.sh`: `h2`, `h2_w01` (menos peso de la NLL), `h2_m64` (vector más pequeño).
+```bash
+python -m tracking.e2e.tests.test_h2                                                   # tests del H2 (CPU)
+bash tracking/scripts/e2e_one_seed.sh local e2e_h2 1 -u motion.mode=gru                # una semilla: entrena, infiere y evalúa
+python -m tracking.e2e.train --train-cache ... --val-cache ... --out ... -u motion.mode=gru
+```
+**Criterio de aceptación del H2**: mejorar al H1 (`h1`) más allá de la desviación entre semillas, sobre todo en cruces y tras oclusiones (AssA, IDF1, IDSW), con el mismo protocolo y el barrido de umbrales.
+**Solo verificado con datos sintéticos en CPU** (el test de entrenamiento comprueba que el predictor aprende un movimiento de velocidad constante); la evaluación real está pendiente.
+Limitaciones: la cámara se mueve poco en DanceTrack, así que el movimiento relativo a la caja es suficiente; no hay compensación de movimiento de cámara. La predicción es de un solo paso (con `gap` como entrada), sin multimodalidad.
+
 ## Entrenamiento en el servidor con UN solo `.slurm`: detector + e2e descongelado
 `slurm/e2e.slurm` sigue las convenciones de la plantilla del clúster (`--export=NONE`, `module purge`, comprobación de `nvcc`, `CUDA_HOME`, conda, diagnóstico en el log) y ejecuta,
 en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso):
 1. **Entrenamiento de RT-DETR** (1 clase; train = DanceTrack + CrowdHuman, val = DanceTrack val; solver con early stopping sobre el AP) → `$OUTPUT_ROOT/$DET_RUN_NAME/best.pth`.
-   Si ya está hecho (marcador `TRAINING_DONE`) se salta; si se cortó por tiempo, **se reanuda** desde `last.pth`. El lote total es el menor múltiplo del nº de GPUs ≥ 16 (RT-DETR exige que sea divisible por las GPUs; el `lr` no se reescala).
-2. **Cuando termina la 1**, entrenamiento **descongelado** del módulo e2e (decoder + módulo, `tracking/e2e/train_joint.py`) partiendo de ese `best.pth`; cada GPU procesa sus propios clips → `$OUTPUT_ROOT/$E2E_RUN_NAME/`.
-
+   **Cuándo se salta** (el `.slurm` lo decide al empezar y lo imprime con el prefijo `[detector]`): con `DET_CKPT_EXTERNAL=<ruta/best.pth>` (se usa ese checkpoint tal cual, de otra carpeta o ejecución); o si existe `$DET_RUN_NAME/best.pth` y hay marcador `TRAINING_DONE`;
+   o si hay `best.pth` **sin `last.pth`** (un entrenamiento en curso siempre tiene `last.pth`, así que es un checkpoint final copiado o importado); o si hay `last.pth` pero el entrenamiento ya terminó (llegó a `DET_EPOCHS` o paró por early stopping, según `log.txt` y `early_stop.json`; se crea el marcador).
+   Si el entrenamiento **no** terminó, **se reanuda** desde `last.pth`. Si hay marcador pero falta `best.pth`, se avisa y se reentrena. `FORCE_DET=1` reentrena siempre. Cuando se salta, la etapa 0 solo prepara DanceTrack (no descarga CrowdHuman ni rehace los COCO). El lote total es el menor múltiplo del nº de GPUs ≥ 16 (RT-DETR exige que sea divisible por las GPUs; el `lr` no se reescala).
+2. **Cuando termina la 1**, entrenamiento **descongelado** del módulo e2e (decoder + módulo, `tracking/e2e/train_joint.py`) partiendo de ese `best.pth`; cada GPU procesa sus propios clips → `$OUTPUT_ROOT/$E2E_RUN_NAME/` (por defecto `e2e_unfrozen_<variante>`).
+   La variante por defecto es **`h2`** (GRU de movimiento); cámbiala con `sbatch --export=ALL,E2E_VARIANT=h1 slurm/e2e.slurm` (o `h2_w01`, `h2_m64`, …, de `tracking/configs/e2e_variants.sh`).
 Por ahora **no** se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull                            # logs/ ya viene en el repo (Slurm la necesita antes de arrancar)
@@ -105,14 +128,14 @@ torchrun --standalone --nproc_per_node=5 -m tracking.e2e.train_joint --det-ckpt 
 UNFROZEN_GPUS=5 LAMBDAS="0 10" bash tracking/scripts/e2e_pipeline.sh     # SLURM: pide gpu:5 por trabajo (SBATCH_GPU_TEMPLATE="--gres=gpu:a100:%N")
 ```
 En modo local los trabajos se lanzan en oleadas de `NGPU / UNFROZEN_GPUS` a la vez, cada uno con sus GPUs. Con `UNFROZEN_GPUS=5` los valores de λ se entrenan uno tras otro; con 1, en paralelo.
-Test: `python -m tracking.e2e.tests.test_ddp` (2 procesos en CPU, comprueba que las réplicas siguen idénticas).
+Test: `python -m tracking.e2e.tests.test_ddp` (2 procesos en CPU, con H1 y con H2; comprueba que las réplicas siguen idénticas). Si `torchrun --standalone` se cuelga por un nombre de equipo que no resuelve, el test ya fija `--local-addr 127.0.0.1`.
 
 ### Qué contiene la tabla final
 Baselines (ByteTrack y OC-SORT a 0.6 **y a su mejor umbral del barrido**), cada variante congelada **a su mejor umbral de inferencia** (media ± desviación entre semillas, global y cruces)
 y cada ejecución descongelada (un valor de λ por fila). Los umbrales se eligen sobre val y se reportan sobre val: es optimista, pero se aplica la misma regla a todos.
 
 ### Límites conocidos (léelos antes de lanzar)
-- **Solo está el H1** (q_det + caja, EMA fija). Movimiento, grafo, banco, `a_det` y ruido (H2–H6) **no están implementados**; "la versión descongelada" es el H1 con el decoder descongelado.
+- **Solo están H1 y H2** (q_det + caja, EMA fija y, opcionalmente, GRU de movimiento). Grafo, banco, `a_det` y ruido (H3–H6) **no están implementados**; "la versión descongelada" es el módulo (H1 o H2 según la variante elegida) con el decoder descongelado.
 - **DDP probado solo con 2 procesos en CPU (`gloo`)**, no con GPUs ni NCCL; los tiempos y la memoria por GPU están sin medir. Se asume un **sistema de archivos compartido** entre procesos (la evaluación escribe archivos que lee el proceso principal).
 - **Sin medir en el clúster:** tiempos, memoria y `--time` de los trabajos son estimaciones; los `--gres`, `--partition` y `--account` se pasan por `SBATCH_*`.
 - La tubería se probó **en local con datos sintéticos** (etapas `variant`, `sweep`, `select`, `final`); `cache`, `baseline` y `unfrozen` se probaron por separado y con datos sintéticos o en `DRY_RUN`, no encadenadas con datos reales.
@@ -123,8 +146,8 @@ Igualar a `ema` (misma actualización) y no quedar por debajo de `graph` más al
 globales y en cruces). **Solo se ha verificado con datos sintéticos en CPU**; la comprobación real es en la workstation o el clúster.
 
 ### Próximos hitos
-H2 predictor de movimiento (GRU con σ) · H3 transformer de grafo · H4 banco histórico · H5 `a_det` (RoIAlign; vector por query en la caché mientras el detector esté
-congelado) · H6 ruido de entrenamiento · H7 descongelar el decoder (BN en eval, DDP, control de AP y DetA).
+H3 transformer de grafo · H4 banco histórico · H5 `a_det` (RoIAlign; vector por query en la caché mientras el detector esté
+congelado) · H6 ruido de entrenamiento · H7 descongelar el decoder (BN en eval, DDP, control de AP y DetA; ya implementado). H2 (predictor de movimiento) ya implementado.
 
 ## Preparación automática de datos (etapa 0 de `slurm/e2e.slurm`)
 

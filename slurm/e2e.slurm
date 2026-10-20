@@ -14,9 +14,10 @@
 #
 # DOS ETAPAS EN UN MISMO TRABAJO, ambas con DDP (torchrun, una GPU por proceso):
 #   1. ENTRENAMIENTO DE RT-DETR (detección de personas, 1 clase; train = DanceTrack + CrowdHuman, val = DanceTrack val; solver con early stopping sobre el AP de val)
-#      -> $OUTPUT_ROOT/$DET_RUN_NAME/best.pth     (checkpoint de detección). Se salta si ya está hecho (marcador); si se cortó por tiempo, se REANUDA desde last.pth.
+#      -> $OUTPUT_ROOT/$DET_RUN_NAME/best.pth     (checkpoint de detección). Se salta si ya existe el checkpoint final (marcador, best.pth sin last.pth, o DET_CKPT_EXTERNAL=<ruta>); si se cortó por tiempo, se REANUDA desde last.pth.
 #   2. cuando la 1 termina: ENTRENAMIENTO DESCONGELADO del módulo e2e (decoder + módulo, tracking/e2e/train_joint.py) partiendo de ese best.pth; cada GPU procesa sus propios clips.
-#      -> $OUTPUT_ROOT/$E2E_RUN_NAME/   (detector_best/last.pth, e2e_best/last.pth, log.txt).
+#      -> $OUTPUT_ROOT/$E2E_RUN_NAME/   (detector_best/last.pth, e2e_best/last.pth, log.txt). Variante por defecto: h2 (H2, GRU de movimiento);
+#         E2E_VARIANT=h1 para el H1, o cualquiera de tracking/configs/e2e_variants.sh (h2_w01, h2_m64, ...). La carpeta es e2e_unfrozen_<variante>.
 # POR AHORA no se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen en tracking/scripts/e2e_pipeline.sh).
 #
 # USO (sin variables ni pasos previos), desde la RAÍZ del repo (logs/ ya viene en el repo; Slurm la necesita antes de arrancar):
@@ -46,9 +47,10 @@ DET_EPOCHS="${DET_EPOCHS:-24}"                          # épocas máximas (el e
 DET_BATCH="${DET_BATCH:-}"                              # lote TOTAL (suma de todas las GPUs); vacío = el menor múltiplo del nº de GPUs que sea >= 16 (el lr no se reescala; sin validar)
 DET_NUM_WORKERS="${DET_NUM_WORKERS:-4}"                 # workers del dataloader por GPU
 FORCE_DET="${FORCE_DET:-0}"                             # 1 = reentrenar el detector aunque ya exista
+DET_CKPT_EXTERNAL="${DET_CKPT_EXTERNAL:-}"              # ruta a un best.pth de detección ya entrenado (de otra carpeta/ejecución): se usa tal cual y NO se entrena el detector
 # --- Etapa 2: entrenamiento descongelado del módulo e2e (DDP) ---
-E2E_RUN_NAME="${E2E_RUN_NAME:-e2e_unfrozen}"            # carpeta de salida en $OUTPUT_ROOT
-E2E_VARIANT="${E2E_VARIANT:-h1}"                        # variante de tracking/configs/e2e_variants.sh
+E2E_VARIANT="${E2E_VARIANT:-h2}"                        # variante de tracking/configs/e2e_variants.sh: h2 = H2 (GRU de movimiento, segundo vector por track); h1 = H1 (solo apariencia)
+E2E_RUN_NAME="${E2E_RUN_NAME:-e2e_unfrozen_$E2E_VARIANT}"   # carpeta de salida en $OUTPUT_ROOT (lleva la variante: no pisa ejecuciones de otra variante)
 LAMBDA="${LAMBDA:-10}"                                  # peso de la pérdida e2e frente a la de detección (sin ajustar; 0 = solo se ajusta el detector)
 CLIPS_PER_GPU="${CLIPS_PER_GPU:-1}"                     # clips por GPU y paso (lote efectivo = clips por GPU x nº de GPUs)
 JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs)
@@ -145,7 +147,37 @@ NGPU="${SLURM_GPUS_ON_NODE:-$(python -c 'import torch; print(torch.cuda.device_c
 [ -n "$DET_BATCH" ] || DET_BATCH=$(( (16 + NGPU - 1) / NGPU * NGPU ))
 DET_OUT="$OUTPUT_ROOT/$DET_RUN_NAME"; DET_CKPT="$DET_OUT/best.pth"; DET_DONE="$DET_OUT/TRAINING_DONE"
 E2E_OUT="$OUTPUT_ROOT/$E2E_RUN_NAME"
-echo "Job $SLURM_JOB_ID en $(hostname): $NGPU GPU(s) | detector: $DET_OUT (lote total $DET_BATCH) | e2e: $E2E_OUT"
+
+# --- ¿Hay ya un detector entrenado? (decide si se salta la etapa 1; con DET_SKIP=1 la etapa 0 solo prepara DanceTrack) ---
+det_finished() {   # el entrenamiento de $DET_OUT terminó: llegó a DET_EPOCHS o paró por early stopping (log.txt + early_stop.json del solver)
+  python - "$DET_OUT" "$DET_EPOCHS" <<'PYEOF'
+import json, sys, yaml
+out, n_ep = sys.argv[1], int(sys.argv[2])
+try:
+    last = [json.loads(l) for l in open(out + '/log.txt') if l.strip()][-1]['epoch']
+    wait = json.load(open(out + '/early_stop.json'))['wait']
+except Exception:
+    sys.exit(1)
+es = dict(patience=5, min_epochs=6)
+es.update((yaml.safe_load(open('tracking/configs/detector_r50vd_person.yml')) or {}).get('early_stopping', {}) or {})
+sys.exit(0 if last + 1 >= n_ep or (wait >= es['patience'] and last + 1 >= es['min_epochs']) else 1)
+PYEOF
+}
+DET_SKIP=0
+if [ "$FORCE_DET" = "1" ]; then
+  echo "[detector] FORCE_DET=1: se reentrena aunque exista"
+elif [ -n "$DET_CKPT_EXTERNAL" ]; then
+  [ -f "$DET_CKPT_EXTERNAL" ] || { echo "ERROR: DET_CKPT_EXTERNAL=$DET_CKPT_EXTERNAL no existe" >&2; exit 1; }
+  DET_CKPT="$DET_CKPT_EXTERNAL"; DET_SKIP=1; echo "[detector] checkpoint externo $DET_CKPT: no se entrena el detector"
+elif [ -f "$DET_CKPT" ]; then
+  if [ -f "$DET_DONE" ]; then DET_SKIP=1; echo "[detector] $DET_CKPT y marcador $DET_DONE: ya entrenado"
+  elif [ ! -f "$DET_OUT/last.pth" ]; then DET_SKIP=1; echo "[detector] $DET_CKPT sin last.pth (un entrenamiento en curso siempre lo tiene): se toma como checkpoint final"
+  elif det_finished; then DET_SKIP=1; date '+%Y-%m-%dT%H:%M:%S' > "$DET_DONE"; echo "[detector] $DET_OUT terminó (épocas completas o early stopping) sin marcador: se crea y se salta"
+  else echo "[detector] existe $DET_CKPT pero el entrenamiento NO terminó: se reanuda desde last.pth"; fi
+elif [ -f "$DET_DONE" ]; then
+  echo "[detector] AVISO: existe el marcador $DET_DONE pero no $DET_CKPT: se reentrena"
+fi
+echo "Job $SLURM_JOB_ID en $(hostname): $NGPU GPU(s) | detector: $DET_CKPT (lote total $DET_BATCH, saltar entrenamiento: $DET_SKIP) | e2e: $E2E_OUT"
 #export OMP_NUM_THREADS=1
 
 need() { [ -e "$1" ] || { echo "ERROR: falta $1 ($2)" >&2; exit 1; }; }
@@ -179,13 +211,14 @@ link_existing() {   # link_existing <ok_fn> <destino> <nombre...>: si hay una co
 }
 prepare_data() {
   link_existing dancetrack_ok "$DANCETRACK_DIR" DanceTrack dancetrack
-  [ "$USE_CROWDHUMAN" = "1" ] && link_existing crowdhuman_ok "$CROWDHUMAN_DIR" CrowdHuman crowdhuman
+  [ "$USE_CROWDHUMAN" = "1" ] && [ "$DET_SKIP" != "1" ] && link_existing crowdhuman_ok "$CROWDHUMAN_DIR" CrowdHuman crowdhuman
   if ! dancetrack_ok; then
     echo "[datos] DanceTrack ausente o incompleto en $DANCETRACK_DIR: se descarga"
     net_ok huggingface.co || { echo "ERROR: sin internet en este nodo para descargar DanceTrack. Descárgalo antes desde el login: bash setup_env/download_dancetrack.sh $ENV_NAME" >&2; exit 1; }
     eval "${DT_DOWNLOAD_CMD:-bash setup_env/download_dancetrack.sh $ENV_NAME}"
     dancetrack_ok || { echo "ERROR: DanceTrack sigue incompleto tras la descarga (¿extracción interrumpida?). Borra la carpeta incompleta de $DANCETRACK_DIR y relanza." >&2; exit 1; }
   fi
+  [ "$DET_SKIP" = "1" ] && { echo "[datos] detector ya entrenado: solo se necesita DanceTrack (sin COCO, CrowdHuman ni mezcla)"; return 0; }
   if ! { json_ok "$COCO_DIR/dancetrack/annotations/train.json" && json_ok "$COCO_DIR/dancetrack/annotations/val.json"; }; then
     echo "[datos] convirtiendo DanceTrack a COCO (stride train $DT_STRIDE_TRAIN, val $DT_STRIDE_VAL)"
     python tracking/data/convert_dancetrack.py --stride-train "$DT_STRIDE_TRAIN" --stride-val "$DT_STRIDE_VAL"
@@ -220,7 +253,7 @@ if [ "$PREPARE_DATA" = "1" ]; then
 else
   echo "[datos] PREPARE_DATA=0: no se prepara nada, solo se comprueba"
 fi
-if [ ! -f "$DET_DONE" ] || [ "$FORCE_DET" = "1" ]; then
+if [ "$DET_SKIP" != "1" ]; then
   need "$COCO_DIR/detector_train/annotations/train.json" "COCO de train = DanceTrack + CrowdHuman mezclado: python tracking/data/merge_coco.py (Fase 2)"
   need "$COCO_DIR/dancetrack/annotations/val.json" "COCO de val de DanceTrack: python tracking/data/convert_dancetrack.py (Fase 2)"
   if [ ! -f "$CKPT_DIR/rtdetrv2_r50vd_6x_coco_ema.pth" ]; then   # checkpoint COCO de partida; los nodos de cómputo pueden no tener internet
@@ -231,11 +264,12 @@ fi
 need "$DANCETRACK_DIR/train1" "DanceTrack (train1, train2, val) para la etapa 2"; need "$DANCETRACK_DIR/val" "DanceTrack val"
 
 # ============================== ETAPA 1: entrenamiento de RT-DETR ==============================
-if [ -f "$DET_DONE" ] && [ "$FORCE_DET" != "1" ]; then
-  echo "[etapa 1] detector ya entrenado ($DET_DONE): se salta"
+if [ "$DET_SKIP" = "1" ]; then
+  need "$DET_CKPT" "checkpoint de detección"
+  echo "[etapa 1] detector ya entrenado ($DET_CKPT): se salta"
 else
   echo "[etapa 1] entrenando RT-DETR con $NGPU GPU(s)"
-  RESUME_FLAG=0; [ -f "$DET_OUT/last.pth" ] && [ "$FORCE_DET" != "1" ] && RESUME_FLAG=1
+  RESUME_FLAG=0; [ -f "$DET_OUT/last.pth" ] && [ "$FORCE_DET" != "1" ] && RESUME_FLAG=1   # sin FORCE_DET, un last.pth sin terminar se reanuda
   # PResNet.pretrained=False: el backbone se carga del checkpoint COCO, no hace falta descargar pesos ImageNet (los nodos pueden no tener internet)
   NGPU=$NGPU RUN_NAME="$DET_RUN_NAME" EPOCHS="$DET_EPOCHS" BATCH="$DET_BATCH" NUM_WORKERS="$DET_NUM_WORKERS" RESUME=$RESUME_FLAG \
     bash tracking/scripts/train_detector.sh "$ENV_NAME" PResNet.pretrained=False

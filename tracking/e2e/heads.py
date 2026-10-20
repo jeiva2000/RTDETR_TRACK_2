@@ -36,19 +36,24 @@ def geometry_b(tbox, gap, dbox, dscore):
 
 
 class AffinityHead(nn.Module):
-    def __init__(self, dim, hidden, tau_init=2.3):
+    def __init__(self, dim, hidden, tau_init=2.3, geo_extra=0, null_extra=0):
+        """geo_extra / null_extra: nº de rasgos adicionales (H2: movimiento) en la rama geométrica y en la columna nula; 0 = H1."""
         super().__init__()
         self.q_s, self.q_p = nn.Linear(dim, dim), nn.Linear(dim, dim)
         self.log_tau = nn.Parameter(torch.tensor(float(tau_init)))      # exp(2.3) ~ 10
-        self.geo = mlp(GEO_DIM, 64, 1)
-        self.null = mlp(dim + 1, hidden, 1)                             # columna nula: [a, frames sin ver/10]
+        self.geo = mlp(GEO_DIM + geo_extra, 64, 1)
+        self.null = mlp(dim + 1 + null_extra, hidden, 1)                # columna nula: [a, frames sin ver/10, (m, log σ medio)]
 
-    def forward(self, a, tbox, gap, p, dbox, dscore, dvalid):
-        """a (B,N,D) tbox (B,N,4) gap (B,N) | p (B,K,D) dbox (B,K,4) dscore (B,K) dvalid (B,K) -> logits (B,N,K+1)."""
+    def forward(self, a, tbox, gap, p, dbox, dscore, dvalid, geo_extra=None, null_extra=None):
+        """a (B,N,D) tbox (B,N,4) gap (B,N) | p (B,K,D) dbox (B,K,4) dscore (B,K) dvalid (B,K) -> logits (B,N,K+1).
+        geo_extra (B,N,K,E) y null_extra (B,N,E2) son opcionales (rasgos de movimiento del H2)."""
         app = self.log_tau.exp() * F.normalize(self.q_s(a), dim=-1) @ F.normalize(self.q_p(p), dim=-1).transpose(1, 2)
-        logit = (app + self.geo(geometry_b(tbox, gap, dbox, dscore)).squeeze(-1)).masked_fill(~dvalid[:, None, :], float('-inf'))
-        null = self.null(torch.cat([a, (gap.float() / 10)[..., None]], -1))
-        return torch.cat([logit, null], -1)
+        geo = geometry_b(tbox, gap, dbox, dscore)
+        if geo_extra is not None:
+            geo = torch.cat([geo, geo_extra], -1)
+        logit = (app + self.geo(geo).squeeze(-1)).masked_fill(~dvalid[:, None, :], float('-inf'))
+        nin = torch.cat([a, (gap.float() / 10)[..., None]] + ([null_extra] if null_extra is not None else []), -1)
+        return torch.cat([logit, self.null(nin)], -1)
 
 
 class BirthHead(nn.Module):

@@ -1,4 +1,4 @@
-"""Inferencia frame a frame del módulo e2e (H1) sobre la caché de val: mantiene el estado y exporta MOT (<out>/<seq>.txt) para evaluar
+"""Inferencia frame a frame del módulo e2e (H1/H2) sobre la caché de val: mantiene el estado y exporta MOT (<out>/<seq>.txt) para evaluar
 con tracking/baseline/evaluate.py (mismo protocolo que ByteTrack/OC-SORT y las variantes de assoc/).
 Por frame: afinidad -> Hungarian global -> actualización -> muerte por max_age -> nacimientos: detecciones sin asignar con probabilidad de la
 cabeza de nacimiento >= infer.birth_thr (infer.birth_mode=head) y score >= infer.min_score; con infer.birth_mode=score solo cuenta la regla de score, con supresión de duplicados (IoU >= infer.birth_nms, voraz por score).
@@ -11,7 +11,6 @@ from tracking.baseline.mot_io import write_mot
 from tracking.e2e.config import load_config
 from tracking.e2e.heads import box_iou_b
 from tracking.e2e.model import E2EModel
-from tracking.e2e.state import TrackState
 from tracking.e2e.tokens import from_cache
 
 
@@ -24,7 +23,7 @@ def _row(frame, tid, box, score, W, H):
 def track_sequence(model, d, cfg, device):
     emb, box, sc = d['emb'].to(device).float(), d['boxes'].to(device).float(), d['scores'].to(device).float()
     W, H = d['meta']['width'], d['meta']['height']
-    state = TrackState.empty(1, cfg.state.max_tracks, cfg.heads.dim, device)
+    state = model.new_state(1, device)
     next_id, rows, dropped = 1, [], 0
     for t in range(emb.shape[0]):
         frame = torch.tensor([t + 1], device=device)

@@ -121,7 +121,7 @@ def main(a):
     @torch.no_grad()
     def eval_live():
         model.eval()
-        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0)
+        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0, motion_sum=0.0, n_motion=0)
         for i in range(rank, len(val_ds), world):          # cada proceso evalúa sus clips (rank::world) y se suman los recuentos
             c = val_ds[i]
             lg, bx, em = extract_eval(c['images'].to(dev))
@@ -135,7 +135,7 @@ def main(a):
         model.train(); det.set_train(True)
         tot = du.sum_dicts(tot)
         return dict(acc=tot['ok'] / max(tot['n'], 1), acc_present=tot['ok_present'] / max(tot['present'], 1),
-                    loss=tot['assoc_sum'] / max(tot['n'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1))
+                    loss=tot['assoc_sum'] / max(tot['n'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1), motion_nll=tot['motion_sum'] / max(tot['n_motion'], 1))
 
     with torch.no_grad():
         d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
