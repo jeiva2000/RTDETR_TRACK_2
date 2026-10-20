@@ -37,16 +37,21 @@ class _Frames(torch.utils.data.Dataset):
 
 
 @torch.no_grad()
-def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=4, device='cuda:0', extra_thrs=()):
+def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=4, device='cuda:0', extra_thrs=(), dist=None):
     """DetA (TrackEval) de las detecciones con score >= thr en los frames (f-1) % stride == 0. fwd(images) -> logits, boxes (cxcywh norm).
     Devuelve DetA (a thr), n_det y, si se piden extra_thrs, DetA_by_thr {umbral: DetA} (útil para separar un cambio de calibración
-    de scores de un empeoramiento real)."""
+    de scores de un empeoramiento real).
+    dist (opcional, p. ej. tracking.e2e.dist_utils): con varios procesos cada uno evalúa solo sus secuencias (seqs[rank::world]) y escribe sus
+    archivos (distintos entre procesos: sin carreras en work_dir); tras una barrera, rank 0 puntúa con TrackEval y el resultado se DIFUNDE: todos los
+    procesos devuelven el MISMO diccionario (imprescindible: de él salen decisiones de control de flujo, como parar el entrenamiento).
+    Es una operación colectiva: la deben llamar todos los procesos. Sin dist (o con world = 1) todo ocurre en el proceso actual."""
     from tracking.baseline.evaluate import trackeval_run
+    rank, world = (dist.rank(), dist.world()) if dist is not None else (0, 1)
     thrs = [thr] + [t for t in extra_thrs if t != thr]
     gt_dir = os.path.join(work_dir, 'strided_gt')
-    lengths = make_strided_gt(val_root, seqs, stride, gt_dir)
+    lengths = make_strided_gt(val_root, seqs, stride, gt_dir) if rank == 0 else None     # solo rank 0 puntúa: no hace falta que escriban todos
     n_det = {t: 0 for t in thrs}
-    for s in seqs:
+    for s in seqs[rank::world]:
         info = read_seqinfo(os.path.join(val_root, s))
         frames = list(range(1, info['length'] + 1, stride))
         dl = torch.utils.data.DataLoader(_Frames(os.path.join(val_root, s), info['ext'], frames), batch_size=batch, num_workers=num_workers)
@@ -63,15 +68,21 @@ def eval_deta(fwd, val_root, seqs, stride, thr, work_dir, batch=16, num_workers=
             sel = [r for r in rows if r[6] >= t]
             n_det[t] += len(sel)
             write_mot(os.path.join(work_dir, f'strided_dets_{t}', f'{s}.txt'), sel)
-    by_thr = {}
-    for t in thrs:
-        with contextlib.redirect_stdout(io.StringIO()):
-            by_thr[t] = trackeval_run(gt_dir, os.path.join(work_dir, f'strided_dets_{t}'), lengths)['DetA']
-    out = dict(DetA=by_thr[thr], n_det=n_det[thr])
-    if extra_thrs:
-        out['DetA_by_thr'] = {str(t): by_thr[t] for t in thrs}
-        out['n_det_by_thr'] = {str(t): n_det[t] for t in thrs}
-    return out
+    out = None
+    if world > 1:
+        dist.barrier()                                                    # todos los archivos escritos antes de puntuar
+        parts = dist.all_gather_object(n_det)
+        n_det = {t: sum(p[t] for p in parts) for t in thrs}
+    if rank == 0:
+        by_thr = {}
+        for t in thrs:
+            with contextlib.redirect_stdout(io.StringIO()):
+                by_thr[t] = trackeval_run(gt_dir, os.path.join(work_dir, f'strided_dets_{t}'), lengths)['DetA']
+        out = dict(DetA=by_thr[thr], n_det=n_det[thr])
+        if extra_thrs:
+            out['DetA_by_thr'] = {str(t): by_thr[t] for t in thrs}
+            out['n_det_by_thr'] = {str(t): n_det[t] for t in thrs}
+    return dist.broadcast_object(out) if world > 1 else out
 
 
 @torch.no_grad()

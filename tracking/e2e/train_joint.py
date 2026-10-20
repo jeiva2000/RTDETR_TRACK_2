@@ -139,7 +139,7 @@ def main(a):
 
     with torch.no_grad():
         d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
-                       num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs)
+                       num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs, dist=du)
     v0 = eval_live()
     c0 = control_value(d0, a.deta_metric)
     P(f'inicial: DetA({a.deta_metric})={c0:.2f} por umbral={ {k: round(x, 2) for k, x in d0.get("DetA_by_thr", {}).items()} } '
@@ -176,10 +176,10 @@ def main(a):
                       f'{(time.time() - t0) / run["n"]:.2f}s/it', flush=True)
         with torch.no_grad():
             d = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
-                          num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs)
+                          num_workers=a.num_workers, extra_thrs=a.deta_extra_thrs, dist=du)
         v = eval_live()
         cv = control_value(d, a.deta_metric)
-        ok = cv >= c0 - a.deta_tol
+        ok = bool(du.broadcast_object(cv >= c0 - a.deta_tol))     # la decisión de parar la toma rank 0 y es la misma en todos: si no, unos procesos salen del bucle y otros siguen (DDP se bloquea)
         rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), DetA=d['DetA'], DetA_control=cv,
                    DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), n_det=d['n_det'],
                    val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], deta_ok=bool(ok), time=time.time() - t0)

@@ -24,6 +24,45 @@ def make_sequence(root, name, n=30, persons=3):
     np.savetxt(d + '/gt/gt.txt', np.array(rows), delimiter=',', fmt='%d')
 
 
+def _stub_fwd(x):
+    """Detector falso determinista: tres cajas fijas con score 0.88 en cada imagen."""
+    B = x.shape[0]
+    boxes = torch.tensor([[0.2, 0.5, 0.15, 0.55], [0.45, 0.5, 0.15, 0.55], [0.7, 0.5, 0.15, 0.55]]).expand(B, 3, 4)
+    return torch.full((B, 3, 1), 2.0), boxes
+
+
+def _deta_worker(rank, world, tmp, seqs, port, q):
+    os.environ.update(MASTER_ADDR='127.0.0.1', MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world), LOCAL_RANK=str(rank))
+    from tracking.e2e import dist_utils as du
+    from tracking.joint.evaluate import eval_deta
+    du.init_distributed()
+    res = eval_deta(_stub_fwd, tmp + '/val', seqs, 2, 0.5, tmp + '/work_dist', num_workers=0, device='cpu', extra_thrs=[0.7], dist=du)
+    q.put((rank, res)); du.cleanup()
+
+
+def test_eval_deta_sharded_matches_single_process():
+    """Regresión del bloqueo de H1 en el clúster: el DetA se calculaba con TODAS las secuencias en CADA proceso y todos escribían a la vez en la misma
+    carpeta; los resultados podían diferir entre procesos, la decisión de parar el entrenamiento también, y DDP se quedaba esperando (hasta el timeout).
+    Ahora cada proceso evalúa sus secuencias y rank 0 puntúa y difunde: ambos procesos deben devolver EL MISMO resultado, igual al de un solo proceso."""
+    import random
+    from tracking.joint.evaluate import eval_deta
+    with tempfile.TemporaryDirectory() as tmp:
+        seqs = []
+        for i, n in enumerate([3, 2, 3, 1]):                      # secuencias distintas: el reparto entre procesos no es simétrico
+            make_sequence(tmp + '/val', f'seq{i}', n=12, persons=n); seqs.append(f'seq{i}')
+        ref = eval_deta(_stub_fwd, tmp + '/val', seqs, 2, 0.5, tmp + '/work_single', num_workers=0, device='cpu', extra_thrs=[0.7])
+        ctx = torch.multiprocessing.get_context('spawn')
+        q = ctx.Queue(); port = random.randint(20000, 40000)
+        procs = [ctx.Process(target=_deta_worker, args=(r, 2, tmp, seqs, port, q)) for r in range(2)]
+        [p.start() for p in procs]
+        got = dict(q.get(timeout=300) for _ in range(2))
+        [p.join(timeout=60) for p in procs]
+        assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+        assert got[0] == got[1], f'los procesos deben devolver lo mismo: {got}'
+        assert got[0] == ref, f'repartido != un proceso: {got[0]} vs {ref}'
+        assert ref['n_det'] > 0 and 0 < ref['DetA'] < 100, ref
+
+
 def test_ddp_two_processes_cpu(extra_ov=()):
     from src.core import YAMLConfig
     from tracking.video.extractor import DEFAULT_CONFIG
@@ -54,5 +93,6 @@ def test_ddp_two_processes_cpu_motion():
 
 
 if __name__ == '__main__':
+    test_eval_deta_sharded_matches_single_process(); print('ok   test_eval_deta_sharded_matches_single_process')
     test_ddp_two_processes_cpu(); print('ok   test_ddp_two_processes_cpu')
     test_ddp_two_processes_cpu_motion(); print('ok   test_ddp_two_processes_cpu_motion')
