@@ -37,6 +37,7 @@ mkdir -p logs
 
 ENV_NAME="${ENV_NAME:-hpc}"                  # archivo de rutas: setup_env/paths.${ENV_NAME}.env (PROJECT_ROOT, DATA_ROOT, CKPT_DIR, OUTPUT_ROOT, SEED, CONDA_ENV...)
 source setup_env/load.sh "$ENV_NAME"
+SEED="${E2E_SEED:-${SEED:-42}}"                         # E2E_SEED sustituye a SEED de paths.<env>.env (con --export=ALL,E2E_SEED=2 y otro E2E_RUN_PREFIX se repite todo con otra semilla)
 
 # ============================== CONFIGURACIÓN (EDITA AQUÍ) ==============================
 # --- Etapa 0: preparación de datos (solo se ejecuta lo que FALTA; todo se salta si ya está) ---
@@ -363,8 +364,8 @@ comparison_table() {
     ARGS+=("${V}_e2e=$EV/seed_run/eval.json")
     for T in bytetrack ocsort; do
       [ -f "$EV/baseline/$T.json" ] && ARGS+=("${V}_${T}_0.6=$EV/baseline/$T.json")
-      F=$(best_baseline "$EV/baseline/sweep" "$T")
-      if [ -n "$F" ]; then N=$(basename "$F" .json); ARGS+=("${V}_${N}=$F"); fi          # p. ej. h1_bytetrack_0.7 (mejor umbral por HOTA)
+      F=$(best_baseline "$EV/baseline/sweep" "$T")                                         # mejor umbral por HOTA; si es el 0.6 ya está en la fila anterior (no se duplica)
+      if [ -n "$F" ] && [ "$(basename "$F" .json)" != "${T}_0.6" ]; then N=$(basename "$F" .json); ARGS+=("${V}_${T}_mejor_${N#${T}_}=$F"); fi   # p. ej. h1_bytetrack_mejor_0.7
     done
   done
   [ "${#ARGS[@]}" -gt 0 ] || { echo "[etapa 3] no hay evaluaciones que tabular"; return 1; }

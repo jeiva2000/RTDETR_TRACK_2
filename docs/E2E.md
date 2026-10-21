@@ -103,6 +103,21 @@ python -m tracking.e2e.train --train-cache ... --val-cache ... --out ... -u h3.e
 E2E_RUN_VARIANTS="h3 h3_norel" sbatch --export=ALL slurm/e2e.slurm             # fase 2 y evaluación, variantes elegidas
 ```
 
+### Diagnóstico del H3: dónde falla (`slurm/h3_diagnose.slurm`)
+Trabajo corto (1 GPU, sin entrenar) que usa lo que dejó `e2e.slurm` en `$OUTPUT_ROOT/e2e_unfrozen_<variante>/` y contesta **dónde** falla la asociación, no solo cuánto. Lanzar: `sbatch slurm/h3_diagnose.slurm` (variables: `DIAG_VARIANT`, `DIAG_COMPARE`, `DIAG_MODES`, `DIAG_MAX_SEQS`, `DIAG_OVERRIDES`, `DIAG_RESWEEP`, `DIAG_MIN_PROB`, `DIAG_SCORES`).
+1. **Resumen de los `log.txt`** de las variantes (`val_acc`, épocas, parada por DetA): ¿aprendió H3 a asociar tanto como H1/H2?
+2. **`tracking.e2e.h3.diagnose`** sobre la caché de val, con el ID GT que guarda cada query (`track_id`), en dos modos: **`closed`** (el modelo y su memoria como en inferencia) y **`teacher`** (la memoria se actualiza con la asignación GT, así que cada decisión se evalúa con un estado limpio).
+   Si en `teacher` el modelo acierta y en `closed` no, el problema es la acumulación de errores (desajuste entrenamiento–inferencia); si falla también en `teacher`, no ha aprendido a asociar. Mide, por modo:
+   - el acierto de los tracks con su detección presente (correcta / rechazada sin asignar / enlazada a otra identidad / enlazada a un falso positivo) y de los ausentes (falso enlace);
+   - el **top-1 de cada señal por separado** (apariencia, movimiento, relacional, afinidad con gates, probabilidad de Sinkhorn): si los gates empeoran la mejor señal suelta o una rama no discrimina, se ve aquí;
+   - el peso medio de los gates, la distribución de `P_ij` de las parejas verdaderas y la **curva frente al umbral `h3.min_prob`** (parejas verdaderas que lo superan frente a falsos enlaces posibles);
+   - la caja predicha por el GRU frente a la última caja observada;
+   - en `closed`, las **causas de los cambios de ID** (`rebirth_prev_alive`: el track anterior seguía vivo y la detección nació como ID nuevo; `rebirth_after_kill`: murió por `max_age` antes de reaparecer; `swap_link`: enlace a otra identidad; `switch_back`), los nacimientos (identidad nueva, re-aparición, falso positivo, **perdidos por falta de hueco**) y los IDs creados frente a los del GT.
+   El informe (`diagnose/report.md` y `.json`, y una copia en `$OUTPUT_ROOT/h3_diagnose_report.md`) acaba con **pistas heurísticas**: orientan, no demuestran.
+3. **Re-barrido con métricas reales** (HOTA, AssA, IDF1, IDSW) de `h3.min_prob` × `h3.new_thr` sobre una **copia** de la evaluación (no pisa `eval/seed_run`).
+Tiempos sin medir; con `DIAG_MAX_SEQS=2 DIAG_RESWEEP=0` es una prueba rápida. La herramienta solo admite checkpoints de H3. Se puede lanzar a mano: `python -m tracking.e2e.h3.diagnose run --ckpt <e2e_best.pth> --cache <features/val> --out <dir> [-u h3.min_prob=0.3]` y `... logs --runs <e2e_unfrozen_h1> ...`.
+Tests: `python -m tracking.e2e.tests.test_h3_diagnose` (los contadores suman el total; un umbral imposible se detecta y se atribuye a `rebirth_prev_alive`).
+
 ## Entrenamiento en el servidor con UN solo `.slurm`: detector + e2e descongelado
 `slurm/e2e.slurm` sigue las convenciones de la plantilla del clúster (`--export=NONE`, `module purge`, comprobación de `nvcc`, `CUDA_HOME`, conda, diagnóstico en el log) y ejecuta,
 en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso):
