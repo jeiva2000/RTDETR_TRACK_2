@@ -19,7 +19,10 @@
 #      Se entrenan SECUENCIALMENTE las variantes de E2E_RUN_VARIANTS (por defecto "h1 h2": H1 = solo apariencia, H2 = + GRU de movimiento), cada una desde el mismo detector
 #      -> $OUTPUT_ROOT/e2e_unfrozen_<variante>/   (detector_best/last.pth, e2e_best/last.pth, log.txt, marcador TRAINING_DONE). Una variante terminada se salta al relanzar (FORCE_E2E=1 la repite);
 #         si una falla, las demás se ejecutan igualmente y el trabajo termina con error al final. Otras variantes: tracking/configs/e2e_variants.sh (h2_w01, h2_m64, ...).
-# POR AHORA no se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen en tracking/scripts/e2e_pipeline.sh).
+#   3. EVALUACIÓN de cada variante entrenada (RUN_EVAL=0 la desactiva): caché de val con SU detector ajustado, ByteTrack y OC-SORT con ese mismo detector (a 0.6 y a su mejor umbral), barrido de
+#      los umbrales de nacimiento del módulo e2e y evaluación completa con TrackEval (HOTA, DetA, AssA, IDF1, IDSW; global y en cruces). Una semilla por ejecución.
+#      -> $OUTPUT_ROOT/e2e_unfrozen_<variante>/eval/   y la tabla comparativa de todas las variantes en $OUTPUT_ROOT/e2e_unfrozen_comparacion.md
+# POR AHORA no se ejecutan las variantes con detector congelado (siguen en tracking/scripts/e2e_pipeline.sh).
 #
 # USO (sin variables ni pasos previos), desde la RAÍZ del repo (logs/ ya viene en el repo; Slurm la necesita antes de arrancar):
 #        cd ~/work/RTDETR_TRACK_2 && git pull && sbatch slurm/e2e.slurm
@@ -53,6 +56,8 @@ DET_CKPT_EXTERNAL="${DET_CKPT_EXTERNAL:-}"              # ruta a un best.pth de 
 E2E_RUN_VARIANTS="${E2E_RUN_VARIANTS:-${E2E_VARIANT:-h1 h2}}"   # variantes de tracking/configs/e2e_variants.sh que se entrenan, EN ESTE ORDEN y una tras otra (h1 = solo apariencia; h2 = + GRU de movimiento). E2E_VARIANT=<una> sigue valiendo para una sola
 E2E_RUN_PREFIX="${E2E_RUN_PREFIX:-e2e_unfrozen}"        # carpeta de cada variante en $OUTPUT_ROOT: <prefijo>_<variante>
 FORCE_E2E="${FORCE_E2E:-0}"                             # 1 = reentrenar también las variantes que ya terminaron (marcador TRAINING_DONE)
+RUN_EVAL="${RUN_EVAL:-1}"                               # 1 = tras entrenar, evaluar cada variante (etapa 3); 0 = solo entrenar
+FORCE_EVAL="${FORCE_EVAL:-0}"                           # 1 = repetir la evaluación de las variantes ya evaluadas (marcador eval/EVAL_DONE)
 LAMBDA="${LAMBDA:-10}"                                  # peso de la pérdida e2e frente a la de detección (sin ajustar; 0 = solo se ajusta el detector)
 CLIPS_PER_GPU="${CLIPS_PER_GPU:-1}"                     # clips por GPU y paso (lote efectivo = clips por GPU x nº de GPUs)
 JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs)
@@ -310,4 +315,69 @@ for V in $E2E_RUN_VARIANTS; do
   fi
 done
 echo "[etapa 2] resumen: entrenadas=[${DONE_NOW[*]:-}] saltadas=[${SKIPPED[*]:-}] fallidas=[${FAILED[*]:-}]"
-[ "${#FAILED[@]}" -eq 0 ] || exit 1
+
+# ============================== ETAPA 3: evaluación de cada variante (HOTA, DetA, AssA, IDF1, IDSW; global y cruces) ==============================
+# Por variante: (1) caché de val con su detector ajustado (detector_best.pth), (2) ByteTrack y OC-SORT con ESE detector (a 0.6 y barrido de track_thresh),
+# (3) barrido de umbrales de nacimiento del módulo e2e (e2e_best.pth) y evaluación completa con el mejor. Los umbrales se eligen sobre val y se reportan sobre val
+# (optimista), con la misma regla para todos los métodos. Cada paso es idempotente; un fallo en una variante no impide evaluar las demás.
+eval_variant() {   # eval_variant <variante>; con set -e desactivado dentro de funciones llamadas con ||, cada paso lleva "|| return 1"
+  local V="$1" OUT EV RUN VAL
+  OUT="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V"; EV="$OUT/eval"; RUN="$EV/seed_run"; VAL="$DANCETRACK_DIR/val"
+  if [ -f "$EV/EVAL_DONE" ] && [ "$FORCE_EVAL" != "1" ]; then echo "[etapa 3:$V] ya evaluada ($EV/EVAL_DONE): se salta"; return 0; fi
+  if [ ! -f "$OUT/detector_best.pth" ] || [ ! -f "$OUT/e2e_best.pth" ]; then
+    echo "[etapa 3:$V] ERROR: faltan detector_best.pth / e2e_best.pth en $OUT (¿ninguna época válida o no entrenada?)" >&2; return 1
+  fi
+  mkdir -p "$EV"
+  echo "[etapa 3:$V] $(date '+%F %T') caché de val con el detector ajustado"
+  if [ ! -f "$OUT/features/val/stats.json" ]; then
+    python -m tracking.video.cache_features --ckpt "$OUT/detector_best.pth" --split val --min-iou 0.5 --out "$OUT/features/val" || return 1
+  fi
+  echo "[etapa 3:$V] $(date '+%F %T') ByteTrack y OC-SORT con el mismo detector"
+  DET_CKPT="$OUT/detector_best.pth" FEAT_DIR="$OUT/features" PIPE_NAME="${E2E_RUN_PREFIX}_$V/eval" FORCE="$FORCE_EVAL" \
+    bash tracking/scripts/pipe_stage.sh "$ENV_NAME" baseline || return 1
+  echo "[etapa 3:$V] $(date '+%F %T') barrido de umbrales de nacimiento y evaluación del módulo e2e"
+  mkdir -p "$RUN"; cp "$OUT/e2e_best.pth" "$RUN/best.pth" || return 1
+  python -m tracking.e2e.sweep run --runs "$RUN" --ckpt-name best.pth --cache "$OUT/features/val" --gt-root "$VAL" --out "$EV/sweep" --sweep-seeds 1 || return 1
+  date '+%Y-%m-%dT%H:%M:%S' > "$EV/EVAL_DONE"
+  echo "[etapa 3:$V] terminada: $RUN/eval.json"
+}
+best_baseline() {   # best_baseline <dir sweep> <tracker>: ruta del JSON con mayor HOTA global entre los umbrales probados
+  python3 - "$1" "$2" <<'PYEOF'
+import glob, json, sys
+best = max(((json.load(open(f))['global_']['HOTA'], f) for f in glob.glob(f'{sys.argv[1]}/{sys.argv[2]}_*.json')), default=None)
+print(best[1] if best else '')
+PYEOF
+}
+comparison_table() {
+  local ARGS=() V EV T F N TABLE="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_comparacion.md"
+  for V in $E2E_RUN_VARIANTS; do
+    EV="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V/eval"
+    [ -f "$EV/seed_run/eval.json" ] || continue
+    ARGS+=("${V}_e2e=$EV/seed_run/eval.json")
+    for T in bytetrack ocsort; do
+      [ -f "$EV/baseline/$T.json" ] && ARGS+=("${V}_${T}_0.6=$EV/baseline/$T.json")
+      F=$(best_baseline "$EV/baseline/sweep" "$T")
+      if [ -n "$F" ]; then N=$(basename "$F" .json); ARGS+=("${V}_${N}=$F"); fi          # p. ej. h1_bytetrack_0.7 (mejor umbral por HOTA)
+    done
+  done
+  [ "${#ARGS[@]}" -gt 0 ] || { echo "[etapa 3] no hay evaluaciones que tabular"; return 1; }
+  { python -m tracking.baseline.make_table "${ARGS[@]}"
+    echo; echo "Configuración de inferencia elegida para el módulo e2e (barrido sobre val; una semilla por variante):"
+    for V in $E2E_RUN_VARIANTS; do
+      F="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V/eval/seed_run/best_infer.json"
+      [ -f "$F" ] && echo "- $V: $(cat "$F")"
+    done; } | tee "$TABLE"
+  echo "[etapa 3] tabla comparativa: $TABLE"
+}
+EVAL_FAILED=()
+if [ "$RUN_EVAL" = "1" ]; then
+  echo "[etapa 3] evaluación de: $E2E_RUN_VARIANTS"
+  for V in $E2E_RUN_VARIANTS; do
+    eval_variant "$V" || { EVAL_FAILED+=("$V"); echo "[etapa 3:$V] ERROR: la evaluación falló; se continúa con la siguiente" >&2; }
+  done
+  comparison_table || true
+  echo "[etapa 3] resumen: evaluaciones fallidas=[${EVAL_FAILED[*]:-}]"
+else
+  echo "[etapa 3] RUN_EVAL=0: no se evalúa"
+fi
+[ "${#FAILED[@]}" -eq 0 ] && [ "${#EVAL_FAILED[@]}" -eq 0 ] || exit 1

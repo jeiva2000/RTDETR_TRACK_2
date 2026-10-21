@@ -84,7 +84,18 @@ en **un solo trabajo de un nodo y con DDP en ambas etapas** (una GPU por proceso
    (`FORCE_E2E=1` la repite) y una ejecución a medias se aparta como `<carpeta>_previo_<jobid>` (el entrenamiento e2e no tiene reanudación). Si una variante **falla**, las demás se ejecutan igualmente y el trabajo
    termina con error al final (el resumen lista entrenadas / saltadas / fallidas). Elegir otras: `sbatch --export=ALL,E2E_RUN_VARIANTS="h2 h2_w01" slurm/e2e.slurm`; una sola: `E2E_RUN_VARIANTS=h2` (o `E2E_VARIANT=h2`).
    El tiempo es la suma de las variantes: ajusta `-t` de la cabecera `#SBATCH` (aún sin medir).
-Por ahora **no** se ejecutan las variantes con detector congelado, el barrido de umbrales ni las evaluaciones (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
+3. **Evaluación de cada variante** (etapa 3; `RUN_EVAL=0` la desactiva). Para cada variante entrenada, en `$OUTPUT_ROOT/e2e_unfrozen_<variante>/eval/`:
+   - caché de val con **su** detector ajustado (`detector_best.pth`);
+   - **ByteTrack y OC-SORT con ese mismo detector**, a 0.6 y barriendo `track_thresh` (reutiliza la etapa `baseline` de `pipe_stage.sh`);
+   - barrido de los umbrales de nacimiento del módulo (`birth_mode`, `birth_thr`, `min_score`) con `e2e_best.pth` y evaluación completa con el mejor: **HOTA, DetA, AssA, IDF1, IDSW, global y en cruces**, con TrackEval (`eval/seed_run/eval.json`; la configuración elegida, en `best_infer.json`).
+
+   Al final se escribe la tabla comparativa de todas las variantes en **`$OUTPUT_ROOT/e2e_unfrozen_comparacion.md`** (filas `<variante>_e2e`, `<variante>_bytetrack_0.6`, `<variante>_bytetrack_<mejor umbral>`, igual para OC-SORT) y la configuración de inferencia elegida.
+   Cada variante deja el marcador `eval/EVAL_DONE` y se salta al relanzar (`FORCE_EVAL=1` repite la evaluación, baselines incluidos); un fallo en una variante no impide evaluar las demás, y el trabajo sale con error al final si algo falló.
+   **Cómo leerla:** los umbrales se eligen sobre val y se reportan sobre val (optimista; la misma regla para todos los métodos). Es **una semilla por ejecución**: diferencias de pocos puntos de HOTA entre H1 y H2 no son concluyentes sin repetir con otra `SEED`
+   (±2–3 puntos de HOTA entre semillas en sintético, sin medir con datos reales). Cada variante tiene su propio detector ajustado, así que sus baselines no son idénticos entre variantes.
+   Tiempo extra: caché de val + detección de val + barrido de umbrales por variante (sin medir); ajusta `-t`.
+
+Por ahora **no** se ejecutan las variantes con detector congelado (siguen disponibles en `tracking/scripts/e2e_pipeline.sh`).
 ```bash
 cd ~/work/RTDETR_TRACK_2 && git pull                            # logs/ ya viene en el repo (Slurm la necesita antes de arrancar)
 cp setup_env/paths.hpc.env.example setup_env/paths.hpc.env      # rutas absolutas (si aún no existe); las salidas van por defecto a <repo>/outputs
