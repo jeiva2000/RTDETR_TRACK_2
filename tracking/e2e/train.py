@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 from tracking.e2e.config import load_config
 from tracking.e2e.losses import IGNORE, assoc_loss, birth_loss
-from tracking.e2e.model import E2EModel
+from tracking.e2e.model import build_model
 from tracking.e2e.motion import box_delta, motion_loss
 from tracking.e2e.tokens import from_cache
 from tracking.video.clips import CachedClipDataset
@@ -24,7 +24,10 @@ def collate(items):
 
 
 def run_batch(model, batch, cfg, device, train, ss):
-    """Un lote de clips en paralelo. Devuelve (pérdida total, estadísticas)."""
+    """Un lote de clips en paralelo. Devuelve (pérdida total, estadísticas). Con h3.enabled=true lo ejecuta el bucle del H3 (tracking/e2e/h3/train.py)."""
+    if cfg.h3.enabled:
+        from tracking.e2e.h3.train import run_batch_h3
+        return run_batch_h3(model, batch, cfg, device, train, ss)
     emb, boxes, scores = batch['emb'].to(device), batch['boxes'].to(device), batch['scores'].to(device)
     tid, frames = batch['tid'].to(device), batch['frames'].to(device)
     B, T, K, _ = emb.shape
@@ -82,8 +85,17 @@ def run_batch(model, batch, cfg, device, train, ss):
     loss = cfg.loss.w_assoc * sa / max(na, 1) + cfg.loss.w_birth * sb / max(nb, 1) + cfg.loss.w_motion * sm / max(nm, 1)
     f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)
     st.update(assoc_sum=f(sa), birth_sum=f(sb), n_birth=nb, motion_sum=f(sm), n_motion=nm)
-    st['parts'] = dict(assoc=f(sa) / max(na, 1), birth=f(sb) / max(nb, 1), motion=f(sm) / max(nm, 1))   # las tres partes de la pérdida, sin ponderar
+    st['parts'] = dict(assoc=f(sa) / max(na, 1), birth=f(sb) / max(nb, 1), **({'motion': f(sm) / max(nm, 1)} if model.motion is not None else {}))   # partes de la pérdida, sin ponderar
     return loss, st
+
+
+def val_names(cfg):
+    """Nombres de las métricas de validación que sustituyen a birth_loss y motion_nll: en el H3 son L_app y L_motion (InfoNCE y L1+GIoU)."""
+    return ('app_loss', 'motion_loss') if cfg.h3.enabled else ('birth_loss', 'motion_nll')
+
+
+def has_motion(cfg):
+    return bool(cfg.h3.branches.mot) if cfg.h3.enabled else cfg.motion.mode != 'none'
 
 
 def evaluate(model, ds, cfg, device):
@@ -96,10 +108,11 @@ def evaluate(model, ds, cfg, device):
             for k in tot:
                 tot[k] += s[k]
     model.train()
-    out = dict(loss=tot['assoc_sum'] / max(tot['n'], 1), acc=tot['ok'] / max(tot['n'], 1),
-               acc_present=tot['ok_present'] / max(tot['present'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1))
+    nb_name, nm_name = val_names(cfg)
+    out = {'loss': tot['assoc_sum'] / max(tot['n'], 1), 'acc': tot['ok'] / max(tot['n'], 1),
+           'acc_present': tot['ok_present'] / max(tot['present'], 1), nb_name: tot['birth_sum'] / max(tot['n_birth'], 1)}
     if tot['n_motion']:
-        out['motion_nll'] = tot['motion_sum'] / tot['n_motion']
+        out[nm_name] = tot['motion_sum'] / tot['n_motion']
     if tot['cross']:
         out['acc_cross'] = tot['ok_cross'] / tot['cross']
     if tot['overflow']:
@@ -116,8 +129,8 @@ def main(a):
     train_ds = CachedClipDataset(a.train_cache, None, samples_per_epoch=T.samples_per_epoch, seed=a.seed, **kw)
     val_ds = CachedClipDataset(a.val_cache, None, samples_per_epoch=T.val_samples, seed=12345, **kw)
     in_dim = train_ds.data[train_ds.seqs[0]]['emb'].shape[-1]
-    model = E2EModel(cfg, in_dim).to(dev)
-    print(f'E2EModel (motion={cfg.motion.mode}): {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parámetros', flush=True)
+    model = build_model(cfg, in_dim).to(dev)
+    print(f'{type(model).__name__} (motion={"h3" if cfg.h3.enabled else cfg.motion.mode}): {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parámetros', flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=T.lr, weight_decay=T.weight_decay)
     os.makedirs(a.out, exist_ok=True)
     json.dump(dict(cfg=cfg, seed=a.seed), open(os.path.join(a.out, 'args.json'), 'w'), indent=1)
@@ -127,16 +140,16 @@ def main(a):
         train_ds.seed = a.seed + ep
         order = list(range(len(train_ds))); random.shuffle(order)
         t0, run_loss, nb = time.time(), 0.0, 0
-        run_parts = dict(assoc=0.0, birth=0.0, motion=0.0)
+        run_parts = {}
         for b in range(0, len(order), T.batch):
             loss, st_b = run_batch(model, collate([train_ds[i] for i in order[b:b + T.batch]]), cfg, dev, True, ss)
-            for k in run_parts:
-                run_parts[k] += st_b['parts'][k]
+            for k, x in st_b['parts'].items():
+                run_parts[k] = run_parts.get(k, 0.0) + x
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), T.clip_grad)
             opt.step(); run_loss += float(loss); nb += 1
         v = evaluate(model, val_ds, cfg, dev)
-        parts = {f'train_{k}': x / max(nb, 1) for k, x in run_parts.items() if k != 'motion' or cfg.motion.mode != 'none'}   # motion solo con H2
+        parts = {f'train_{k}': x / max(nb, 1) for k, x in run_parts.items()}
         log = dict(epoch=ep, ss=ss, train_loss=run_loss / max(nb, 1), **parts, **{f'val_{k}': x for k, x in v.items()}, time=time.time() - t0)
         print(json.dumps(log), flush=True)
         open(os.path.join(a.out, 'log.txt'), 'a').write(json.dumps(log) + '\n')

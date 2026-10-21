@@ -1,14 +1,18 @@
-"""Módulo e2e con el decoder DESCONGELADO (ajuste conjunto): se entrena a la vez el decoder del detector y el módulo e2e, con extracción
-en línea (sin caché). Backbone y encoder congelados y sin gradiente; BatchNorm del decoder en eval (ver tracking/joint/train.py, clase Detector).
-Pérdida = detección completa de RT-DETRv2 sobre los frames del clip + lambda_e2e * pérdida e2e (asociación + nacimiento) con gradiente hacia el decoder a
-través de los embeddings (cajas y scores se desconectan). Grupos de parámetros: decoder a --lr-det (2e-5) y módulo a train.lr de la config.
+"""Módulo e2e con el detector DESCONGELADO (ajuste conjunto): se entrenan a la vez el detector (por defecto decoder + encoder + backbone) y el módulo e2e, con extracción
+en línea (sin caché). Como en el entrenamiento por defecto de RT-DETRv2, la primera capa del backbone y las normalizaciones del backbone siguen congeladas; todo el
+detector va en eval (BatchNorm con estadísticas fijas: con lotes de frames de un mismo clip las del lote no son las de la población; ver tracking/joint/train.py, clase Detector).
+--no-train-backbone / --no-train-encoder los dejan congelados (sin gradiente) para ablaciones o para ahorrar memoria y tiempo.
+Pérdida = detección completa de RT-DETRv2 sobre los frames del clip + lambda_e2e * pérdida e2e con gradiente hacia el detector a través de los embeddings
+(cajas y scores se desconectan). Grupos de parámetros: decoder a --lr-det (2e-5), encoder a --lr-encoder (por defecto = --lr-det), backbone a --lr-backbone (por defecto
+--lr-det / 10, la misma proporción que RT-DETRv2: 1e-4 / 1e-5; sin validar) y módulo a train.lr de la config; un único recorte de gradiente (--clip-det) para el detector.
 Control del detector: DetA en val cada época (por defecto la media de los umbrales 0.5/0.6/0.7, que es menos sensible a desplazamientos de calibración de
 los scores que un solo umbral); si cae más de --deta-tol puntos por debajo del DetA inicial, se informa y se detiene. Con módulo desde cero, los primeros
---det-freeze-steps pasos solo aprende el módulo (decoder a lr 0).
-DDP (varias GPUs): cada proceso (una GPU) procesa --clips-per-gpu clips distintos por paso (DistributedSampler) y los gradientes se sincronizan con DDP; el lote
-efectivo es clips-por-GPU x nº de GPUs y --samples-per-epoch cuenta clips de TODAS las GPUs. La evaluación (DetA y precisión en vivo) se reparte entre procesos.
+--det-freeze-steps pasos solo aprende el módulo (todo el detector a lr 0).
+DDP (varias GPUs): cada proceso (una GPU) procesa --clips-per-gpu clips distintos por paso (DistributedSampler) y los gradientes se sincronizan con DDP (el backbone y el
+encoder entrenables se registran en JointModule: si no, DDP no los sincronizaría); el lote efectivo es clips-por-GPU x nº de GPUs y --samples-per-epoch cuenta clips de TODAS
+las GPUs. La evaluación (DetA y precisión en vivo) se reparte entre procesos. Entrenar el backbone cuesta bastante más memoria y tiempo por paso (sin medir en GPU).
 Lanzamiento: torchrun --standalone --nproc_per_node=N -m tracking.e2e.train_joint ...   (sin torchrun, una sola GPU).
-Salidas en --out: detector_{best,last}.pth ({'model'}), e2e_{best,last}.pth (compatibles con tracking.e2e.infer), log.txt.
+Salidas en --out: detector_{best,last}.pth ({'model'}: modelo completo, backbone y encoder incluidos), e2e_{best,last}.pth (compatibles con tracking.e2e.infer), log.txt.
 Uso (1 GPU): python -m tracking.e2e.train_joint --det-ckpt <best.pth> --out <dir> [--cfg tracking/configs/e2e.yml] [-u appearance.alpha_app=0.2] [--init-e2e <e2e best.pth>]"""
 import argparse, json, os, random, sys, time
 import numpy as np
@@ -19,8 +23,8 @@ sys.path.insert(0, os.path.join(ROOT, 'rtdetrv2_pytorch')); sys.path.insert(0, R
 from src.core import YAMLConfig
 from tracking.e2e import dist_utils as du
 from tracking.e2e.config import load_config
-from tracking.e2e.model import E2EModel
-from tracking.e2e.train import run_batch
+from tracking.e2e.model import build_model
+from tracking.e2e.train import has_motion, run_batch, val_names
 from tracking.joint.evaluate import eval_deta
 from tracking.joint.train import Detector
 from tracking.video.clips import ImageClipDataset, collate_images
@@ -34,6 +38,10 @@ class JointModule(torch.nn.Module):
     def __init__(self, det, e2e, cfg, K, T, min_iou, lambda_e2e):
         super().__init__()
         self.dec, self.e2e = det.dec, e2e
+        if det.train_backbone:       # registrados como submódulos para que DDP sincronice sus gradientes (det es un objeto normal, no un nn.Module)
+            self.backbone = det.model.backbone
+        if det.train_encoder:
+            self.encoder = det.model.encoder
         self.det, self.cfg, self.K, self.T, self.min_iou, self.lam = det, cfg, K, T, min_iou, lambda_e2e
 
     def forward(self, images, gts, frames, ss, epoch, step):
@@ -50,7 +58,7 @@ class JointModule(torch.nn.Module):
                       tid=tid.view(B, T, K).to(dev), frames=frames, cross=[None] * B)
         loss_e2e, st = run_batch(self.e2e, ebatch, self.cfg, dev, True, ss)
         return (loss_det + self.lam * loss_e2e, loss_det.detach(), loss_e2e.detach(), {k: float(v) for k, v in loss_dict.items()},
-                st['parts'])      # partes de la pérdida e2e (asociación, nacimiento, movimiento) sin ponderar, para el log
+                st['parts'])      # partes de la pérdida e2e (H1/H2: asociación, nacimiento, movimiento; H3: assign, app, motion) sin ponderar, para el log
 
 
 def control_value(d, metric):
@@ -74,8 +82,8 @@ def main(a):
     assert cfg.e2e.enabled, 'e2e.enabled=false: el módulo está desactivado por configuración'
     assert cfg.train.burn_in == 0, 'el ajuste conjunto e2e del H1 no usa burn-in'
     T, K, B = cfg.train.T, cfg.tokens.top_k, a.clips_per_gpu
-    det = Detector(YAMLConfig(a.config, PResNet=dict(pretrained=False)), a.det_ckpt, dev, a.amp)
-    model = E2EModel(cfg, init['in_dim'] if init else 256).to(dev)
+    det = Detector(YAMLConfig(a.config, PResNet=dict(pretrained=False)), a.det_ckpt, dev, a.amp, train_encoder=a.train_encoder, train_backbone=a.train_backbone)
+    model = build_model(cfg, init['in_dim'] if init else 256).to(dev)
     if init:
         model.load_state_dict(init['model'])
     model.train()
@@ -85,13 +93,22 @@ def main(a):
     det_freeze = a.det_freeze_steps if a.det_freeze_steps is not None else (1000 if scratch else 0)
     ss_warmup = cfg.train.ss_warmup if scratch else 0
     matcher = det.criterion.matcher
-    dec_params = [p for p in det.dec.parameters() if p.requires_grad]
+    dec_params, enc_params, bb_params = det.params('decoder'), det.params('encoder'), det.params('backbone')
+    det_params = dec_params + enc_params + bb_params
     lr_mult = {'none': 1.0, 'linear': float(world), 'sqrt': float(world) ** 0.5}[a.lr_scale]     # reescalado del lr con el lote efectivo (opcional, sin validar)
     if lr_mult != 1.0:
         P(f'lr reescalado x{lr_mult:.2f} (--lr-scale {a.lr_scale}, {world} GPUs)')
-    groups = [dict(params=[p for p in dec_params if p.ndim > 1], lr=a.lr_det * lr_mult, weight_decay=1e-4, base=a.lr_det * lr_mult, kind='det'),
-              dict(params=[p for p in dec_params if p.ndim <= 1], lr=a.lr_det * lr_mult, weight_decay=0.0, base=a.lr_det * lr_mult, kind='det'),
-              dict(params=list(model.parameters()), lr=cfg.train.lr * lr_mult, weight_decay=cfg.train.weight_decay, base=cfg.train.lr * lr_mult, kind='mod')]
+    a.lr_encoder = a.lr_det if a.lr_encoder is None else a.lr_encoder
+    a.lr_backbone = a.lr_det / 10 if a.lr_backbone is None else a.lr_backbone
+    P('detector entrenable: ' + ', '.join(f'{n} {sum(p.numel() for p in ps) / 1e6:.2f}M (lr {lr:.1e})' for n, ps, lr in
+                                           (('decoder', dec_params, a.lr_det), ('encoder', enc_params, a.lr_encoder), ('backbone', bb_params, a.lr_backbone)) if ps), flush=True)
+
+    def det_groups(params, lr):     # pesos con weight decay, sesgos y normalizaciones sin él (como RT-DETR); los grupos vacíos se omiten
+        return [dict(params=ps, lr=lr * lr_mult, weight_decay=wd, base=lr * lr_mult, kind='det') for ps, wd in
+                (([p for p in params if p.ndim > 1], 1e-4), ([p for p in params if p.ndim <= 1], 0.0)) if ps]
+
+    groups = (det_groups(dec_params, a.lr_det) + det_groups(enc_params, a.lr_encoder) + det_groups(bb_params, a.lr_backbone) +
+              [dict(params=list(model.parameters()), lr=cfg.train.lr * lr_mult, weight_decay=cfg.train.weight_decay, base=cfg.train.lr * lr_mult, kind='mod')])
     opt = torch.optim.AdamW(groups)
     scaler = torch.cuda.amp.GradScaler(enabled=(a.amp == 'fp16' and torch.device(dev).type == 'cuda'))
     roots = a.train_roots or [os.path.join(a.dancetrack, 'train1'), os.path.join(a.dancetrack, 'train2')]
@@ -154,7 +171,7 @@ def main(a):
             sampler.set_epoch(ep)             # cada época reparte los clips de otra forma, sin solaparse entre procesos
         dl = torch.utils.data.DataLoader(train_ds, batch_size=B, shuffle=(sampler is None), sampler=sampler, num_workers=a.num_workers,
                                          collate_fn=collate_images, drop_last=True)
-        run, t0 = dict(det=0.0, e2e=0.0, assoc=0.0, birth=0.0, motion=0.0, n=0), time.time()
+        run, pr, t0 = dict(det=0.0, e2e=0.0, n=0), {}, time.time()
         for batch in dl:
             images = batch['images'].flatten(0, 1).to(dev)
             gts = [g for g_clip in batch['gts'] for g in g_clip]
@@ -166,17 +183,17 @@ def main(a):
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(dec_params, a.clip_det)
+            torch.nn.utils.clip_grad_norm_(det_params, a.clip_det)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad)
             scaler.step(opt); scaler.update()
             if not torch.isfinite(loss):
                 print(f'[rank {rank}] pérdida no finita; se detiene', loss_dict, float(loss_e2e), flush=True); sys.exit(1)   # torchrun termina el resto de procesos
             run['det'] += float(loss_det); run['e2e'] += float(loss_e2e); run['n'] += 1; step += 1
-            for k in ('assoc', 'birth', 'motion'):
-                run[k] += parts[k]
+            for k, x in parts.items():
+                pr[k] = pr.get(k, 0.0) + x
             if step % a.print_freq == 0 and main_proc:
-                mot = f' motion {parts["motion"]:.3f}' if cfg.motion.mode != 'none' else ''
-                print(f'ep {ep} step {step} det {float(loss_det):.3f} e2e {float(loss_e2e):.3f} (assoc {parts["assoc"]:.3f} birth {parts["birth"]:.3f}{mot}) '
+                pstr = ' '.join(f'{k} {x:.3f}' for k, x in parts.items())
+                print(f'ep {ep} step {step} det {float(loss_det):.3f} e2e {float(loss_e2e):.3f} ({pstr}) '
                       f'lr_dec {opt.param_groups[0]["lr"]:.2e} {(time.time() - t0) / run["n"]:.2f}s/it', flush=True)
         with torch.no_grad():
             d = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
@@ -184,14 +201,15 @@ def main(a):
         v = eval_live()
         cv = control_value(d, a.deta_metric)
         ok = bool(du.broadcast_object(cv >= c0 - a.deta_tol))     # la decisión de parar la toma rank 0 y es la misma en todos: si no, unos procesos salen del bucle y otros siguen (DDP se bloquea)
-        parts = {f'train_{k}': run[k] / max(run['n'], 1) for k in ('assoc', 'birth', 'motion') if k != 'motion' or cfg.motion.mode != 'none'}   # e2e sin ponderar, por partes
-        vparts = dict(val_birth_loss=v['birth_loss'], **(dict(val_motion_nll=v['motion_nll']) if cfg.motion.mode != 'none' else {}))
+        parts = {f'train_{k}': x / max(run['n'], 1) for k, x in pr.items()}                  # e2e sin ponderar, por partes
+        nb_name, nm_name = val_names(cfg)                                                      # H1/H2: birth_loss, motion_nll; H3: app_loss, motion_loss
+        vparts = {f'val_{nb_name}': v['birth_loss'], **({f'val_{nm_name}': v['motion_nll']} if has_motion(cfg) else {})}
         rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), **parts, DetA=d['DetA'], DetA_control=cv,
                    DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), n_det=d['n_det'],
                    val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], **vparts, deta_ok=bool(ok), time=time.time() - t0)
         P(json.dumps(rec), flush=True)
-        if a.check_sync and world > 1:      # las réplicas deben seguir idénticas tras el paso del optimizador
-            sums = du.all_gather_object(du.params_checksum(joint))
+        if a.check_sync and world > 1:      # las réplicas deben seguir idénticas tras el paso del optimizador (detector completo + módulo: no solo lo registrado en JointModule)
+            sums = du.all_gather_object(du.params_checksum(det.model) + du.params_checksum(model))
             P(f'sincronización de réplicas: diferencia máxima entre procesos {max(sums) - min(sums):.3e}', flush=True)
             assert max(sums) - min(sums) < 1e-5 * max(1.0, abs(sums[0])), f'las réplicas divergen: {sums}'
         e2e_state = dict(model=model.state_dict(), cfg=dict(cfg), in_dim=init['in_dim'] if init else 256, epoch=ep, val=v)
@@ -230,6 +248,11 @@ if __name__ == '__main__':
     p.add_argument('--lr-scale', choices=['none', 'linear', 'sqrt'], default='none', help='reescalado del lr con el nº de GPUs (por defecto ninguno; sin validar)')
     p.add_argument('--check-sync', action='store_true', help='comprueba cada época que las réplicas DDP siguen idénticas (para pruebas)')
     p.add_argument('--lr-det', type=float, default=2e-5); p.add_argument('--lambda-e2e', type=float, default=10.0)
+    p.add_argument('--lr-encoder', type=float, default=None, help='lr del encoder (por defecto = --lr-det)')
+    p.add_argument('--lr-backbone', type=float, default=None, help='lr del backbone (por defecto --lr-det / 10)')
+    p.add_argument('--train-encoder', action=argparse.BooleanOptionalAction, default=True, help='entrenar el encoder (por defecto sí; --no-train-encoder lo congela)')
+    p.add_argument('--train-backbone', action=argparse.BooleanOptionalAction, default=True,
+                   help='entrenar el backbone salvo su primera capa y sus normalizaciones, como RT-DETRv2 (por defecto sí; --no-train-backbone lo congela)')
     p.add_argument('--clip-det', type=float, default=0.1); p.add_argument('--warmup-steps', type=int, default=200)
     p.add_argument('--det-freeze-steps', type=int, default=None, help='por defecto 1000 desde cero, 0 con --init-e2e')
     p.add_argument('--min-iou', type=float, default=0.5)

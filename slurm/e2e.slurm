@@ -15,9 +15,10 @@
 # DOS ETAPAS EN UN MISMO TRABAJO, ambas con DDP (torchrun, una GPU por proceso):
 #   1. ENTRENAMIENTO DE RT-DETR (detección de personas, 1 clase; train = DanceTrack + CrowdHuman, val = DanceTrack val; solver con early stopping sobre el AP de val)
 #      -> $OUTPUT_ROOT/$DET_RUN_NAME/best.pth     (checkpoint de detección). Se salta si ya existe el checkpoint final (marcador, best.pth sin last.pth, o DET_CKPT_EXTERNAL=<ruta>); si se cortó por tiempo, se REANUDA desde last.pth.
-#   2. cuando la 1 termina: ENTRENAMIENTO DESCONGELADO del módulo e2e (decoder + módulo, tracking/e2e/train_joint.py) partiendo de ese best.pth; cada GPU procesa sus propios clips.
-#      Se entrenan SECUENCIALMENTE las variantes de E2E_RUN_VARIANTS (por defecto "h1 h2": H1 = solo apariencia, H2 = + GRU de movimiento), cada una desde el mismo detector
-#      -> $OUTPUT_ROOT/e2e_unfrozen_<variante>/   (detector_best/last.pth, e2e_best/last.pth, log.txt, marcador TRAINING_DONE). Una variante terminada se salta al relanzar (FORCE_E2E=1 la repite);
+#   2. cuando la 1 termina: ENTRENAMIENTO DESCONGELADO del módulo e2e (detector + módulo, tracking/e2e/train_joint.py) partiendo de ese best.pth; cada GPU procesa sus propios clips.
+#      El detector se entrena COMPLETO por defecto (decoder, encoder y backbone salvo su primera capa y sus normalizaciones, como RT-DETRv2); --no-train-backbone / --no-train-encoder en JOINT_ARGS los congelan.
+#      Se entrenan SECUENCIALMENTE las variantes de E2E_RUN_VARIANTS (por defecto "h1 h2 h3": H1 = solo apariencia, H2 = + GRU de movimiento, H3 = asociación relacional), cada una desde el mismo detector
+#      -> $OUTPUT_ROOT/e2e_unfrozen_<variante>/   (detector_best/last.pth, e2e_best/last.pth, log.txt, marcador TRAINING_DONE). Una variante terminada se salta al relanzar si se entrenó con la receta actual (el marcador TRAINING_DONE guarda su firma: E2E_TRAIN_REV, overrides, LAMBDA, CLIPS_PER_GPU y JOINT_ARGS); con otra receta se reentrena sola, y FORCE_E2E=1 la repite siempre;
 #         si una falla, las demás se ejecutan igualmente y el trabajo termina con error al final. Otras variantes: tracking/configs/e2e_variants.sh (h2_w01, h2_m64, ...).
 #   3. EVALUACIÓN de cada variante entrenada (RUN_EVAL=0 la desactiva): caché de val con SU detector ajustado, ByteTrack y OC-SORT con ese mismo detector (a 0.6 y a su mejor umbral), barrido de
 #      los umbrales de nacimiento del módulo e2e y evaluación completa con TrackEval (HOTA, DetA, AssA, IDF1, IDSW; global y en cruces). Una semilla por ejecución.
@@ -53,14 +54,15 @@ DET_NUM_WORKERS="${DET_NUM_WORKERS:-4}"                 # workers del dataloader
 FORCE_DET="${FORCE_DET:-0}"                             # 1 = reentrenar el detector aunque ya exista
 DET_CKPT_EXTERNAL="${DET_CKPT_EXTERNAL:-}"              # ruta a un best.pth de detección ya entrenado (de otra carpeta/ejecución): se usa tal cual y NO se entrena el detector
 # --- Etapa 2: entrenamiento descongelado del módulo e2e (DDP) ---
-E2E_RUN_VARIANTS="${E2E_RUN_VARIANTS:-${E2E_VARIANT:-h1 h2}}"   # variantes de tracking/configs/e2e_variants.sh que se entrenan, EN ESTE ORDEN y una tras otra (h1 = solo apariencia; h2 = + GRU de movimiento). E2E_VARIANT=<una> sigue valiendo para una sola
+E2E_RUN_VARIANTS="${E2E_RUN_VARIANTS:-${E2E_VARIANT:-h1 h2 h3}}"   # variantes de tracking/configs/e2e_variants.sh que se entrenan, EN ESTE ORDEN y una tras otra (h1 = solo apariencia; h2 = + GRU de movimiento; h3 = asociación relacional). E2E_VARIANT=<una> sigue valiendo para una sola
 E2E_RUN_PREFIX="${E2E_RUN_PREFIX:-e2e_unfrozen}"        # carpeta de cada variante en $OUTPUT_ROOT: <prefijo>_<variante>
 FORCE_E2E="${FORCE_E2E:-0}"                             # 1 = reentrenar también las variantes que ya terminaron (marcador TRAINING_DONE)
+E2E_TRAIN_REV="${E2E_TRAIN_REV:-2}"                     # versión de la receta de entrenamiento e2e: 1 = solo decoder; 2 = detector completo (backbone + encoder + decoder). Súbela si cambia la receta: las variantes entrenadas con otra se reentrenan solas
 RUN_EVAL="${RUN_EVAL:-1}"                               # 1 = tras entrenar, evaluar cada variante (etapa 3); 0 = solo entrenar
 FORCE_EVAL="${FORCE_EVAL:-0}"                           # 1 = repetir la evaluación de las variantes ya evaluadas (marcador eval/EVAL_DONE)
 LAMBDA="${LAMBDA:-10}"                                  # peso de la pérdida e2e frente a la de detección (sin ajustar; 0 = solo se ajusta el detector)
 CLIPS_PER_GPU="${CLIPS_PER_GPU:-1}"                     # clips por GPU y paso (lote efectivo = clips por GPU x nº de GPUs)
-JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs)
+JOINT_ARGS="${JOINT_ARGS:---epochs 40 --samples-per-epoch 1000 --train-backbone --train-encoder}"   # argumentos extra de tracking.e2e.train_joint (--samples-per-epoch cuenta los clips de TODAS las GPUs; --no-train-backbone / --no-train-encoder los congelan)
 # --- Entorno del clúster y de conda ---
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 CLUSTER_MODULES="${CLUSTER_MODULES:-GCC/12.2.0 CUDA/11.8.0}"
@@ -296,11 +298,16 @@ echo "[etapa 2] variantes en orden: $E2E_RUN_VARIANTS | $NGPU GPU(s), $CLIPS_PER
 FAILED=(); DONE_NOW=(); SKIPPED=()
 for V in $E2E_RUN_VARIANTS; do
   OV=$(overrides_of "$V"); E2E_OUT="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V"
-  if [ -f "$E2E_OUT/TRAINING_DONE" ] && [ "$FORCE_E2E" != "1" ]; then
-    echo "[etapa 2:$V] ya entrenada ($E2E_OUT/TRAINING_DONE): se salta"; SKIPPED+=("$V"); continue
+  SIG="rev=$E2E_TRAIN_REV variant=$V overrides=[$OV] lambda=$LAMBDA clips_per_gpu=$CLIPS_PER_GPU joint_args=[${JOINT_ARGS:-}]"   # receta de entrenamiento (sin nº de GPUs)
+  OLD_SIG=$(sed -n 2p "$E2E_OUT/TRAINING_DONE" 2>/dev/null || true)                                                              # los marcadores antiguos no tienen firma: receta 1
+  if [ -f "$E2E_OUT/TRAINING_DONE" ] && [ "$FORCE_E2E" != "1" ] && [ "$OLD_SIG" = "$SIG" ]; then
+    echo "[etapa 2:$V] ya entrenada con esta receta ($E2E_OUT/TRAINING_DONE): se salta"; SKIPPED+=("$V"); continue
   fi
-  if [ -e "$E2E_OUT" ]; then   # el entrenamiento e2e no tiene reanudación: una ejecución a medias se aparta (no se borra) y se empieza de cero
-    mv "$E2E_OUT" "${E2E_OUT}_previo_$SLURM_JOB_ID"; echo "[etapa 2:$V] AVISO: había una ejecución sin terminar; se aparta en ${E2E_OUT}_previo_$SLURM_JOB_ID"
+  if [ -f "$E2E_OUT/TRAINING_DONE" ] && [ "$FORCE_E2E" != "1" ]; then
+    echo "[etapa 2:$V] entrenada con OTRA receta (marcador: ${OLD_SIG:-sin firma = receta 1, solo decoder}; ahora: $SIG): se reentrena"
+  fi
+  if [ -e "$E2E_OUT" ]; then   # el entrenamiento e2e no tiene reanudación: una ejecución previa (a medias o con otra receta) se aparta (no se borra) y se empieza de cero
+    mv "$E2E_OUT" "${E2E_OUT}_previo_$SLURM_JOB_ID"; echo "[etapa 2:$V] AVISO: había una ejecución previa; se aparta en ${E2E_OUT}_previo_$SLURM_JOB_ID"
   fi
   mkdir -p "$E2E_OUT"
   MASTER_PORT=$((10000 + RANDOM % 20000))
@@ -309,7 +316,7 @@ for V in $E2E_RUN_VARIANTS; do
   if torchrun --master_port="$MASTER_PORT" --nproc_per_node="$NGPU" \
       -m tracking.e2e.train_joint --det-ckpt "$DET_CKPT" --out "$E2E_OUT" --seed "$SEED" --lambda-e2e "$LAMBDA" \
       --clips-per-gpu "$CLIPS_PER_GPU" ${JOINT_ARGS:-} ${OV:+-u $OV}; then
-    date '+%Y-%m-%dT%H:%M:%S' > "$E2E_OUT/TRAINING_DONE"; DONE_NOW+=("$V"); echo "[etapa 2:$V] terminada: $E2E_OUT"
+    { date '+%Y-%m-%dT%H:%M:%S'; echo "$SIG"; } > "$E2E_OUT/TRAINING_DONE"; DONE_NOW+=("$V"); echo "[etapa 2:$V] terminada: $E2E_OUT"
   else
     RC=$?; FAILED+=("$V"); echo "[etapa 2:$V] ERROR: el entrenamiento falló (código $RC); se continúa con la siguiente variante" >&2
   fi

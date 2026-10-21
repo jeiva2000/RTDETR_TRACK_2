@@ -84,11 +84,13 @@ def test_ddp_two_processes_cpu(extra_ov=()):
                 assert float(line.split()[-1]) < 1e-5, line
         recs = [json.loads(l) for l in open(tmp + '/run/log.txt')]
         assert len(recs) == 2 and all(np.isfinite(x['train_det']) and np.isfinite(x['train_e2e']) for x in recs)
-        motion = any('motion.mode=gru' in o for o in extra_ov)
-        for x in recs:   # el e2e se registra también por partes (sin ponderar); la de movimiento solo existe en H2
-            assert all(np.isfinite(x[k]) and x[k] >= 0 for k in ('train_assoc', 'train_birth')), x
-            assert ('train_motion' in x) == motion and ('val_motion_nll' in x) == motion and np.isfinite(x['val_birth_loss']), x
-        assert 'assoc ' in r.stdout and 'birth ' in r.stdout and (('motion ' in r.stdout) == motion), 'las líneas de paso deben mostrar las partes'
+        motion, h3 = any('motion.mode=gru' in o for o in extra_ov), any('h3.enabled=true' in o for o in extra_ov)
+        names = ('assign', 'app', 'motion') if h3 else ('assoc', 'birth', 'motion')        # partes de la pérdida e2e (H3: assign, app, motion)
+        vnames = ('app_loss', 'motion_loss') if h3 else ('birth_loss', 'motion_nll')
+        for x in recs:   # el e2e se registra también por partes (sin ponderar); la de movimiento solo existe en H2/H3
+            assert all(np.isfinite(x[f'train_{k}']) and x[f'train_{k}'] >= 0 for k in names[:2]), x
+            assert (f'train_{names[2]}' in x) == (motion or h3) and (f'val_{vnames[1]}' in x) == (motion or h3) and np.isfinite(x[f'val_{vnames[0]}']), x
+        assert f'{names[0]} ' in r.stdout and f'{names[1]} ' in r.stdout and ((f'{names[2]} ' in r.stdout) == (motion or h3)), 'las líneas de paso deben mostrar las partes'
         assert os.path.isfile(tmp + '/run/e2e_last.pth') and os.path.isfile(tmp + '/run/detector_last.pth')
 
 
@@ -97,7 +99,14 @@ def test_ddp_two_processes_cpu_motion():
     test_ddp_two_processes_cpu(('motion.mode=gru', 'motion.dim=32'))
 
 
+def test_ddp_two_processes_cpu_h3():
+    """Igual con el H3 (asociación relacional): sus parámetros (atención, gates, Sinkhorn) también deben mantenerse idénticos entre réplicas."""
+    test_ddp_two_processes_cpu(('h3.enabled=true', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=4', 'h3.det_thr=0.0',
+                                'state.max_tracks=8', 'tokens.top_k=20'))
+
+
 if __name__ == '__main__':
     test_eval_deta_sharded_matches_single_process(); print('ok   test_eval_deta_sharded_matches_single_process')
     test_ddp_two_processes_cpu(); print('ok   test_ddp_two_processes_cpu')
     test_ddp_two_processes_cpu_motion(); print('ok   test_ddp_two_processes_cpu_motion')
+    test_ddp_two_processes_cpu_h3(); print('ok   test_ddp_two_processes_cpu_h3')

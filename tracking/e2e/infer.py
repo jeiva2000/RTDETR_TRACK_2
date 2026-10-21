@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from tracking.baseline.mot_io import write_mot
 from tracking.e2e.config import load_config
 from tracking.e2e.heads import box_iou_b
-from tracking.e2e.model import E2EModel
+from tracking.e2e.model import build_model
 from tracking.e2e.tokens import from_cache
 
 
@@ -21,6 +21,9 @@ def _row(frame, tid, box, score, W, H):
 
 @torch.no_grad()
 def track_sequence(model, d, cfg, device):
+    if cfg.h3.enabled:
+        from tracking.e2e.h3.infer import track_sequence as track_sequence_h3
+        return track_sequence_h3(model, d, cfg, device)
     emb, box, sc = d['emb'].to(device).float(), d['boxes'].to(device).float(), d['scores'].to(device).float()
     W, H = d['meta']['width'], d['meta']['height']
     state = model.new_state(1, device)
@@ -67,7 +70,7 @@ if __name__ == '__main__':
     if a.update:                                        # ... con los -u de la línea de comandos por encima
         from tracking.e2e.config import deep_update, parse_overrides
         deep_update(cfg, parse_overrides(a.update))
-    model = E2EModel(cfg, ck['in_dim']).to(a.device).eval()
+    model = build_model(cfg, ck['in_dim']).to(a.device).eval()
     model.load_state_dict(ck['model'])
     seqs = a.seqs or sorted(f[:-3] for f in os.listdir(a.cache) if f.endswith('.pt'))
     for s in seqs:

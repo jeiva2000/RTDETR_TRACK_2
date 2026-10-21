@@ -23,17 +23,21 @@ from tracking.joint.evaluate import eval_deta, eval_assoc_live
 
 
 class Detector:
-    """Envoltorio del RTDETR: backbone+encoder sin gradiente y en eval; decoder entrenable. Captura el embedding de la última capa."""
+    """Envoltorio del RTDETR: decoder entrenable; backbone y encoder congelados (sin gradiente) por defecto, o entrenables con train_backbone / train_encoder.
+    Si se entrenan, se respeta lo que fija la configuración de RT-DETRv2 (PResNet.freeze_at=0 deja congelada la primera capa del backbone y freeze_norm sus
+    normalizaciones). Todo el modelo queda en eval (BatchNorm con estadísticas fijas, dropout 0 en el encoder). Captura el embedding de la última capa."""
 
-    def __init__(self, cfg, ckpt, device, amp):
+    def __init__(self, cfg, ckpt, device, amp, train_encoder=False, train_backbone=False):
         ck = torch.load(ckpt, map_location='cpu')
         self.model = cfg.model
         self.model.load_state_dict(ck['ema']['module'] if 'ema' in ck else ck['model'])
         self.model.to(device)
         self.criterion = cfg.criterion.to(device)
-        for m in (self.model.backbone, self.model.encoder):
-            for p in m.parameters():
-                p.requires_grad_(False)
+        self.train_encoder, self.train_backbone = bool(train_encoder), bool(train_backbone)
+        for m, trainable in ((self.model.backbone, self.train_backbone), (self.model.encoder, self.train_encoder)):
+            if not trainable:
+                for p in m.parameters():
+                    p.requires_grad_(False)
         self.dec = self.model.decoder
         self.amp, self.device = amp, device
         self.holder = {}
@@ -55,8 +59,23 @@ class Detector:
         return torch.autocast(device_type=torch.device(self.device).type, dtype=dt, enabled=dt is not None)
 
     def features(self, images):
-        with torch.no_grad(), self.autocast():
-            return self.model.encoder(self.model.backbone(images))
+        """backbone + encoder. Sin gradiente si ambos están congelados; si alguno se entrena, el grafo se construye (si el contexto lo permite: la evaluación va en
+        no_grad). Con el backbone entrenable, el gradiente atraviesa el encoder aunque este esté congelado."""
+        with self.autocast():
+            if self.train_backbone:
+                x = self.model.backbone(images)
+            else:
+                with torch.no_grad():
+                    x = self.model.backbone(images)
+            if self.train_encoder or self.train_backbone:
+                return self.model.encoder(x)
+            with torch.no_grad():
+                return self.model.encoder(x)
+
+    def params(self, part):
+        """Parámetros entrenables de 'backbone', 'encoder' o 'decoder'."""
+        m = {'backbone': self.model.backbone, 'encoder': self.model.encoder, 'decoder': self.dec}[part]
+        return [p for p in m.parameters() if p.requires_grad]
 
     def forward(self, images, targets=None):
         """-> out del decoder, emb (N,300,256) de las queries normales (sin las de denoising)."""

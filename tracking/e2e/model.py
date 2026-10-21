@@ -94,3 +94,11 @@ class E2EModel(nn.Module):
         last = torch.where(matched, frame[:, None].expand_as(state.last), state.last)
         m = state.m if self.motion is None else self.motion.observe(state.m, state.box, box_obs, frame[:, None] - state.last, matched)
         return state.replace(a=a, box=box, last=last, m=m), matched
+
+
+def build_model(cfg, in_dim=256):
+    """E2EModel (H1/H2) o H3Model (h3.enabled=true): el resto del pipeline (entrenamiento, inferencia, barrido) solo usa esta fábrica."""
+    if cfg.h3.enabled:
+        from tracking.e2e.h3.model import H3Model
+        return H3Model(cfg, in_dim)
+    return E2EModel(cfg, in_dim)

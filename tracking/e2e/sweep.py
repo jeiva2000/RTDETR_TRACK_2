@@ -16,7 +16,7 @@ from tracking.baseline.evaluate import evaluate, trackeval_run
 from tracking.baseline.mot_io import read_seqinfo, write_mot
 from tracking.e2e.config import deep_update, load_config, parse_overrides
 from tracking.e2e.infer import track_sequence
-from tracking.e2e.model import E2EModel
+from tracking.e2e.model import build_model
 
 KEYS = ('HOTA', 'DetA', 'AssA', 'IDF1', 'IDSW')
 
@@ -28,6 +28,11 @@ def make_grid(thrs, scores, rule):
     return g
 
 
+def make_grid_h3(probs, scores):
+    """Rejilla del H3 (no hay cabeza de nacimiento): birth_mode='h3', birth_thr = h3.min_prob (umbral de probabilidad de la pareja), min_score = h3.new_thr."""
+    return [dict(birth_mode='h3', birth_thr=p, min_score=s) for p, s in itertools.product(probs, scores)]
+
+
 def cfg_id(c):
     return f"{c['birth_mode']}_thr{c['birth_thr']}_s{c['min_score']}"
 
@@ -35,13 +40,16 @@ def cfg_id(c):
 def load_model(ckpt, device):
     ck = torch.load(ckpt, map_location='cpu')
     cfg = load_config(None, ck['cfg'])
-    model = E2EModel(cfg, ck['in_dim']).to(device).eval()
+    model = build_model(cfg, ck['in_dim']).to(device).eval()
     model.load_state_dict(ck['model'])
     return model, cfg
 
 
 def run_inference(model, cfg, caches, out_dir, c, device):
-    deep_update(cfg, parse_overrides([f"infer.birth_mode={c['birth_mode']}", f"infer.birth_thr={c['birth_thr']}", f"infer.min_score={c['min_score']}"]))
+    if cfg.h3.enabled:
+        deep_update(cfg, parse_overrides([f"h3.min_prob={c['birth_thr']}", f"h3.new_thr={c['min_score']}"]))
+    else:
+        deep_update(cfg, parse_overrides([f"infer.birth_mode={c['birth_mode']}", f"infer.birth_thr={c['birth_thr']}", f"infer.min_score={c['min_score']}"]))
     os.makedirs(out_dir, exist_ok=True)
     for s, d in caches.items():
         rows, _ = track_sequence(model, d, cfg, device)
@@ -52,10 +60,11 @@ def sweep(a):
     seqs = a.seqs or sorted(f[:-3] for f in os.listdir(a.cache) if f.endswith('.pt'))
     caches = {s: torch.load(os.path.join(a.cache, f'{s}.pt')) for s in seqs}
     lengths = {s: read_seqinfo(os.path.join(a.gt_root, s))['length'] for s in seqs}
-    grid = make_grid(a.thr, a.score, not a.no_rule)
     use = a.runs[:a.sweep_seeds] if a.sweep_seeds else a.runs
-    os.makedirs(a.out, exist_ok=True)
     models = {r: load_model(os.path.join(r, a.ckpt_name), a.device) for r in a.runs}
+    h3 = models[a.runs[0]][1].h3.enabled
+    grid = make_grid_h3(a.min_prob, a.score) if h3 else make_grid(a.thr, a.score, not a.no_rule)
+    os.makedirs(a.out, exist_ok=True)
     results = []
     for c in grid:
         per = []
@@ -103,6 +112,7 @@ if __name__ == '__main__':
     r.add_argument('--cache', required=True); r.add_argument('--gt-root', required=True); r.add_argument('--out', required=True)
     r.add_argument('--seqs', nargs='*', default=None)
     r.add_argument('--thr', type=float, nargs='+', default=[0.05, 0.1, 0.3, 0.5]); r.add_argument('--score', type=float, nargs='+', default=[0.5, 0.6])
+    r.add_argument('--min-prob', type=float, nargs='+', default=[0.5], help='solo H3: umbral de probabilidad de la pareja (h3.min_prob); por defecto solo 0.5, pasar varios para barrerlo')
     r.add_argument('--no-rule', action='store_true', help='no probar el nacimiento por regla (solo cabeza)')
     r.add_argument('--sweep-seeds', type=int, default=0, help='usar solo las primeras N semillas para elegir (0 = todas)')
     r.add_argument('--margin', type=int, default=10); r.add_argument('--cross-iou', type=float, default=0.3)

@@ -15,6 +15,20 @@ DEFAULTS = {
               'epochs': 20, 'batch': 8, 'samples_per_epoch': 2000, 'val_samples': 300, 'clip_grad': 1.0,
               'max_stride': 3, 'p_skip': 0.2, 'max_skip': 5},
     'infer': {'birth_mode': 'head', 'birth_thr': 0.5, 'birth_nms': 0.7, 'min_score': 0.0},   # birth_mode: head | score
+    'h3': {                                                          # H3: asociación relacional (tracking/e2e/h3/); h3.enabled=true lo activa en lugar de E2EModel
+        'enabled': False,
+        'det_thr': 0.3,                                              # una query es detección si su score supera este valor (D variable)
+        'K_hist': 10, 'app_dim': 128, 'dim': 256, 'heads': 8, 'ffn': 512, 'geo_hidden': 64,
+        'layers_trk': 1, 'layers_det': 1, 'layers_x': 1,             # capas de auto-atención de tracks, de detecciones y de atención cruzada
+        'gru_dim': 128, 'delta_scale': 10.0, 'sinkhorn_iters': 20, 'tau_init': 2.3,
+        'branches': {'app': True, 'mot': True, 'rel': True},         # ablaciones: desactivar cada rama
+        'gates': True, 'fixed_w': [1 / 3, 1 / 3, 1 / 3],             # gates por par; False = suma con pesos fijos (fixed_w)
+        'memory': {'app_update': 'ema', 'alpha': 0.1, 'edges': False, 'edge_dim': 32},   # app_update: ema | gate; edges: memoria de aristas (fase 2)
+        'loss': {'w_motion': 1.0, 'w_app': 1.0, 'tau_app': 0.1},     # L = L_assign + w_motion·L_motion + w_app·L_app
+        'noise': {'jitter_pos': 0.05, 'jitter_scale': 0.05, 'p_fp': 0.03},   # el drop es train.p_fn
+        'new_thr': 0.6,                                              # score mínimo de una detección sin asignar para crear un track (inferencia)
+        'min_prob': 0.5,                                             # inferencia: una pareja del Hungarian se acepta si su probabilidad de Sinkhorn P_ij >= min_prob
+    },
     'ablation': {},                                                  # banderas de ablación de hitos posteriores
 }
 
