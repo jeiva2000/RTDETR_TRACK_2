@@ -105,7 +105,7 @@ def test_ddp_two_processes_cpu_motion():
 def test_ddp_two_processes_cpu_h3():
     """Igual con el H3 (asociación relacional): sus parámetros (atención, gates, Sinkhorn) también deben mantenerse idénticos entre réplicas."""
     test_ddp_two_processes_cpu(('h3.enabled=true', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=4', 'h3.det_thr=0.0',
-                                'state.max_tracks=8', 'tokens.top_k=20', 'train.ss_max=1.0', 'train.ss_warmup=1'))      # la 2.ª época corre con todos los clips en bucle cerrado
+                                'state.max_tracks=8', 'tokens.top_k=20', 'train.ss_max=1.0', 'train.ss_warmup=1', 'h3.bank.enabled=true', 'h3.bank.size=4'))      # la 2.ª época corre con todos los clips en bucle cerrado
 
 
 if __name__ == '__main__':

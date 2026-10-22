@@ -23,8 +23,8 @@ from tracking.e2e.heads import box_iou_b
 from tracking.e2e.model import build_model
 from tracking.e2e.tokens import from_cache
 
-SIGNALS = ('s_app', 's_mot', 's_rel', 's', 'logP')
-SIGNAL_NAMES = {'s_app': 'apariencia', 's_mot': 'movimiento (GIoU)', 's_rel': 'relacional', 's': 'afinidad con gates', 'logP': 'probabilidad de Sinkhorn'}
+SIGNALS = ('s_app', 's_app_ema', 's_mot', 's_rel', 's', 'logP')
+SIGNAL_NAMES = {'s_app': 'apariencia (con banco si lo hay)', 's_app_ema': 'apariencia (solo EMA)', 's_mot': 'movimiento (GIoU)', 's_rel': 'relacional', 's': 'afinidad con gates', 'logP': 'probabilidad de Sinkhorn'}
 THRS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
@@ -103,7 +103,7 @@ def run_sequence(model, cfg, d, device, mode, S):
         dv = out['det_valid'][0].cpu().numpy()
         a = dict(dv=dv, alive=alive, gt_slot=gt_slot, tid=tid, assign=model_assign, P=out['logP'][0, :K, :mem.N].exp().cpu().numpy(),
                  gates=out['gates'][0].cpu().numpy(), hist_len=mem.hist_len[0].cpu().numpy(), box_pred=out['box_pred'][0].cpu().numpy(),
-                 last=mem.hist[0, :, -1].cpu().numpy(), det_box=box[t].cpu().numpy(), **{k: out[k][0].cpu().numpy() for k in ('s_app', 's_mot', 's_rel', 's')})
+                 last=mem.hist[0, :, -1].cpu().numpy(), det_box=box[t].cpu().numpy(), **{k: out[k][0].cpu().numpy() for k in ('s_app', 's_app_ema', 's_mot', 's_rel', 's')})
         a['logP'] = a['P']                                            # el argmax de P y el de log P coinciden
         analyze_frame(a, S)
         if mode == 'teacher':                                         # asignación GT: la memoria nunca se contamina con errores propios

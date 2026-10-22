@@ -9,6 +9,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from tracking.e2e.h3.affinity_gates import AffinityGates
+from tracking.e2e.h3.appearance_bank import HistoryPool, bank_affinity, bank_valid
 from tracking.e2e.h3.appearance_head import AppearanceHead
 from tracking.e2e.h3.birth_head import H3BirthHead
 from tracking.e2e.h3.assignment import Assignment
@@ -29,9 +30,11 @@ class H3Model(nn.Module):
         self.use_app, self.use_mot, self.use_rel = bool(br.app), bool(br.mot), bool(br.rel)
         dim, ad, H = hc.dim, hc.app_dim, hc.heads
         self.app = AppearanceHead(in_dim, in_dim, ad)
+        self.bank_on = bool(hc.bank.enabled)
+        self.hist_pool = HistoryPool(ad, hc.bank.heads) if self.bank_on else None                     # el token del track consulta su propio banco de apariencias
         self.motion = MotionPredictor(hc.gru_dim, ad, hc.gru_dim, hc.delta_scale) if self.use_mot else None
         if self.use_rel:
-            self.trk_in, self.box_embed, self.det_in = nn.Linear(2 * ad, dim), nn.Linear(4, ad), nn.Linear(2 * ad, dim)
+            self.trk_in, self.box_embed, self.det_in = nn.Linear((3 if hc.bank.enabled else 2) * ad, dim), nn.Linear(4, ad), nn.Linear(2 * ad, dim)    # token del track: [apariencia, movimiento (, resumen del banco)]
             self.trk_layers = nn.ModuleList(GeoSelfLayer(dim, H, hc.ffn, 6, hc.geo_hidden) for _ in range(hc.layers_trk))
             self.det_layers = nn.ModuleList(GeoSelfLayer(dim, H, hc.ffn, 4, hc.geo_hidden) for _ in range(hc.layers_det))
             self.cross_layers = nn.ModuleList(CrossLayer(dim, H, hc.ffn) for _ in range(hc.layers_x))
@@ -48,7 +51,8 @@ class H3Model(nn.Module):
         return self.cfg.h3
 
     def new_memory(self, B, device):
-        return TrackMemory.empty(B, self.cfg.state.max_tracks, self.in_dim, self.hc.K_hist, device, self.hc.memory.edge_dim if self.edges is not None else 0)
+        return TrackMemory.empty(B, self.cfg.state.max_tracks, self.in_dim, self.hc.K_hist, device, self.hc.memory.edge_dim if self.edges is not None else 0,
+                                 self.hc.bank.size if self.bank_on else 0)
 
     def det_valid(self, dets):
         return dets.valid & (dets.score > self.hc.det_thr)
@@ -68,11 +72,19 @@ class H3Model(nn.Module):
         else:
             box_pred, vel, m = mem.hist[:, :, -1], mem.app.new_zeros(B, T, 4), mem.app.new_zeros(B, T, self.hc.app_dim)
         zero = a_det.new_zeros(B, D, T)
-        s_app = a_det @ a_trk.transpose(1, 2) if self.use_app else zero
+        h_hist = None
+        if self.bank_on:                                                                     # banco histórico: afinidad con el máximo sobre el banco y resumen del historial para el token
+            M = mem.bank.shape[2]
+            a_bank, bv = self.app(mem.bank), bank_valid(mem.bank_n, M)
+            s_app, s_ema = bank_affinity(a_det, a_trk, a_bank, bv, self.hc.bank.affinity)
+            h_hist = self.hist_pool(a_trk, a_bank, (frame[:, None, None] - mem.bank_t).clamp(min=0), bv)
+        else:
+            s_app = s_ema = a_det @ a_trk.transpose(1, 2)
+        s_app = s_app if self.use_app else zero
         s_mot = giou_pairwise(dets.box, box_pred) if self.use_mot else zero
         s_rel = zero
         if self.use_rel:
-            xt = self.trk_in(torch.cat([a_trk, m], -1))
+            xt = self.trk_in(torch.cat([a_trk, m] + ([h_hist] if h_hist is not None else []), -1))
             geo_t = pair_geometry(box_pred, vel[..., :2])                                    # geometría de los tracks con la caja PREDICHA en t
             eb = self.edges.attn_bias(mem.edges) if self.edges is not None else None
             for layer in self.trk_layers:
@@ -86,7 +98,7 @@ class H3Model(nn.Module):
             s_rel = logits.mean(1)                                                           # (B,D,T): logits de la última capa, media entre heads
         s, g = self.gates(s_app, s_mot, s_rel, tv)
         logP = self.assign(s, dv, tv)
-        return dict(a_det=a_det, a_trk=a_trk, box_pred=box_pred, vel=vel, s_app=s_app, s_mot=s_mot, s_rel=s_rel, gates=g, s=s, logP=logP, det_valid=dv, trk_valid=tv,
+        return dict(a_det=a_det, a_trk=a_trk, box_pred=box_pred, vel=vel, s_app=s_app, s_app_ema=s_ema, s_mot=s_mot, s_rel=s_rel, gates=g, s=s, logP=logP, det_valid=dv, trk_valid=tv,
                     birth_logit=self.birth_logit(a_det, dets, box_pred, s, logP, tv))
 
     def birth_logit(self, a_det, dets, box_pred, s, logP, tv):
@@ -122,7 +134,14 @@ class H3Model(nn.Module):
         j = assign.clamp(max=D - 1)
         emb_obs = torch.gather(dets.emb, 1, j[..., None].expand(-1, -1, dets.emb.shape[-1]))
         box_obs = torch.gather(dets.box, 1, j[..., None].expand(-1, -1, 4))
-        new = mem.push(matched, box_obs, self.updater(mem.app, emb_obs), frame)
+        write = None
+        if self.bank_on:                                                                     # escribir en el banco solo con detecciones fiables: score alto, sin solape con otra y no demasiado seguido
+            bk = self.hc.bank
+            dv = self.det_valid(dets)
+            ov = box_iou_b(dets.box, dets.box).masked_fill(~dv[:, None, :] | torch.eye(D, dtype=torch.bool, device=dets.box.device)[None], 0.0).max(2).values       # mayor IoU con otra detección válida
+            gather = lambda x: torch.gather(x, 1, j)
+            write = matched & (gather(dets.score) >= bk.write_conf) & (gather(ov) < bk.write_overlap) & ((frame[:, None] - mem.last_write) >= bk.write_every)
+        new = mem.push(matched, box_obs, self.updater(mem.app, emb_obs), frame, emb_obs, write)
         if self.edges is not None:
             new = new.replace(edges=self.edges.update(mem.edges, box_obs, matched))
         return new, matched

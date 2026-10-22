@@ -2,6 +2,9 @@
 K cajas (la más reciente en el índice -1; hist_len estados válidos), id, frame de nacimiento (edad), último frame asignado (frames desde la última asignación) y alive.
 Operaciones fuera de lugar (seguras con autograd/BPTT). Un track sin asignar sigue en memoria (para permitir la re-entrada) hasta superar max_age frames.
 - AppUpdater: actualización de la apariencia del track asignado, con EMA (alpha) o con un gate aprendido (flag memory.app_update = ema | gate).
+- Banco histórico de apariencias (opcional, h3.bank, appearance_bank.py): los últimos M embeddings FIABLES de cada track (bank (B,N,M,in_dim), el más reciente al final; bank_n válidos; bank_t frame
+  de cada uno; last_write frame de la última escritura). Se escribe solo con una detección segura (score) y sin solape con otra (un cruce contamina el embedding), y como mucho cada write_every frames;
+  durante una oclusión el track no se asigna, así que su banco se queda congelado con las apariencias de ANTES de la oclusión. Al nacer, el banco empieza con el embedding de su primera detección.
 - EdgeMemory (fase 2, opcional con memory.edges): vector e_ij por pareja de huecos, actualizado por un GRU cuando ambos tracks se asignan en el frame; entra como sesgo
   adicional por head en la auto-atención de tracks (paso 3). Es un tensor (B,N,N,De) que se pone a 0 al reasignar un hueco (equivale al diccionario por pareja de IDs)."""
 import torch
@@ -12,14 +15,17 @@ from tracking.e2e.heads import mlp
 
 
 class TrackMemory:
-    def __init__(self, app, hist, hist_len, last, born, ids, alive, edges=None):
+    def __init__(self, app, hist, hist_len, last, born, ids, alive, edges=None, bank=None, bank_n=None, bank_t=None, last_write=None):
         self.app, self.hist, self.hist_len, self.last, self.born, self.ids, self.alive, self.edges = app, hist, hist_len, last, born, ids, alive, edges
+        self.bank, self.bank_n, self.bank_t, self.last_write = bank, bank_n, bank_t, last_write         # banco histórico de apariencias (None si está apagado)
 
     @classmethod
-    def empty(cls, B, N, in_dim, K, device, edge_dim=0):
+    def empty(cls, B, N, in_dim, K, device, edge_dim=0, bank_size=0):
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)
         return cls(z(B, N, in_dim), z(B, N, K, 4), z(B, N, dt=torch.long), z(B, N, dt=torch.long), z(B, N, dt=torch.long), -torch.ones(B, N, dtype=torch.long, device=device),
-                   z(B, N, dt=torch.bool), z(B, N, N, edge_dim) if edge_dim > 0 else None)
+                   z(B, N, dt=torch.bool), z(B, N, N, edge_dim) if edge_dim > 0 else None,
+                   z(B, N, bank_size, in_dim) if bank_size > 0 else None, z(B, N, dt=torch.long) if bank_size > 0 else None,
+                   z(B, N, bank_size, dt=torch.long) if bank_size > 0 else None, z(B, N, dt=torch.long) if bank_size > 0 else None)
 
     @property
     def B(self): return self.app.shape[0]
@@ -36,14 +42,16 @@ class TrackMemory:
         return (frame[:, None] - self.born).clamp(min=0)
 
     def replace(self, **kw):
-        d = dict(app=self.app, hist=self.hist, hist_len=self.hist_len, last=self.last, born=self.born, ids=self.ids, alive=self.alive, edges=self.edges)
+        d = dict(app=self.app, hist=self.hist, hist_len=self.hist_len, last=self.last, born=self.born, ids=self.ids, alive=self.alive, edges=self.edges,
+                 bank=self.bank, bank_n=self.bank_n, bank_t=self.bank_t, last_write=self.last_write)
         d.update(kw)
         return TrackMemory(**d)
 
     def drop(self, dead):
         """Elimina los tracks marcados en dead (B,N)."""
         dead = dead & self.alive
-        return self.replace(alive=self.alive & ~dead, ids=torch.where(dead, -torch.ones_like(self.ids), self.ids), hist_len=torch.where(dead, torch.zeros_like(self.hist_len), self.hist_len))
+        extra = {} if self.bank is None else dict(bank_n=torch.where(dead, torch.zeros_like(self.bank_n), self.bank_n))
+        return self.replace(alive=self.alive & ~dead, ids=torch.where(dead, -torch.ones_like(self.ids), self.ids), hist_len=torch.where(dead, torch.zeros_like(self.hist_len), self.hist_len), **extra)
 
     def kill(self, frame, max_age):
         """Elimina los tracks con más de max_age frames sin asignar."""
@@ -65,15 +73,31 @@ class TrackMemory:
         if self.edges is not None:       # el hueco empieza sin aristas (ni como origen ni como destino)
             edges = self.edges.clone()
             edges[b, slot], edges[b, :, slot] = 0.0, 0.0
-        return TrackMemory(app, hist, hl, last, born, idv, alive, edges), n
+        bank = bank_n = bank_t = last_write = None
+        if self.bank is not None:        # el banco del hueco empieza con el embedding de su primera detección
+            bank, bank_n, bank_t, last_write = self.bank.clone(), self.bank_n.clone(), self.bank_t.clone(), self.last_write.clone()
+            bank[b, slot] = 0.0
+            bank[b, slot, -1] = app0[:n]
+            bank_n[b, slot], last_write[b, slot] = 1, frame_b
+            bank_t[b, slot] = 0
+            bank_t[b, slot, -1] = frame_b
+        return TrackMemory(app, hist, hl, last, born, idv, alive, edges, bank, bank_n, bank_t, last_write), n
 
-    def push(self, matched, box_obs, app_new, frame):
-        """Tracks asignados (matched (B,N)): añaden su caja al historial, actualizan la apariencia y el último frame."""
+    def push(self, matched, box_obs, app_new, frame, emb_obs=None, write=None):
+        """Tracks asignados (matched (B,N)): añaden su caja al historial, actualizan la apariencia y el último frame. Con banco, write (B,N) (⊆ matched) marca los que añaden emb_obs
+        (B,N,in_dim), el embedding de su detección, al banco (el más antiguo sale)."""
         K = self.hist.shape[2]
         shifted = torch.cat([self.hist[:, :, 1:], box_obs[:, :, None]], 2)
+        extra = {}
+        if self.bank is not None and write is not None:
+            M = self.bank.shape[2]
+            stamp = frame[:, None].expand_as(self.last)
+            extra = dict(bank=torch.where(write[..., None, None], torch.cat([self.bank[:, :, 1:], emb_obs[:, :, None]], 2), self.bank),
+                         bank_t=torch.where(write[..., None], torch.cat([self.bank_t[:, :, 1:], stamp[..., None]], 2), self.bank_t),
+                         bank_n=torch.where(write, (self.bank_n + 1).clamp(max=M), self.bank_n), last_write=torch.where(write, stamp, self.last_write))
         return self.replace(app=torch.where(matched[..., None], app_new, self.app), hist=torch.where(matched[..., None, None], shifted, self.hist),
                             hist_len=torch.where(matched, (self.hist_len + 1).clamp(max=K), self.hist_len),
-                            last=torch.where(matched, frame[:, None].expand_as(self.last), self.last))
+                            last=torch.where(matched, frame[:, None].expand_as(self.last), self.last), **extra)
 
 
 class AppUpdater(nn.Module):

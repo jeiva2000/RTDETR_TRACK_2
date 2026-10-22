@@ -8,6 +8,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from tracking.e2e.config import load_config
 from tracking.e2e.h3 import assignment as A
+from tracking.e2e.h3.appearance_bank import HistoryPool, bank_affinity, bank_valid
 from tracking.e2e.h3.affinity_gates import AffinityGates, row_margin
 from tracking.e2e.h3.appearance_head import AppearanceHead
 from tracking.e2e.h3.geometry import giou, giou_pairwise
@@ -531,6 +532,144 @@ def test_birth_head_learns_on_synthetic():
             _, ev = run_batch(m, collate([ds[i], ds[i + 8]]), cfg, 'cpu', False, 1.0)
             tot['births'] += ev['births']; tot['dup'] += ev['births_dup']; tot['fp'] += ev['births_fp']; tot['gt'] += ev['gt_ids']
         assert tot['births'] <= 1.2 * tot['gt'] and tot['dup'] + tot['fp'] <= 0.1 * tot['births'] and tot['births'] >= 0.8 * tot['gt'], f'nacen las identidades nuevas y poco más: {tot}'
+
+
+def _bank_model(**bank):
+    return _model(bank=dict(enabled=True, size=4, **bank))
+
+
+def _bank_mem(m, B, alive, seed=3):
+    """Memoria con banco: los vivos con 1..M embeddings aleatorios; los huecos libres, con basura que debe ignorarse."""
+    g = torch.Generator().manual_seed(seed)
+    mem = _mem(m, B, alive)
+    M = mem.bank.shape[2]
+    n = torch.where(mem.alive, torch.randint(1, M + 1, (B, mem.N), generator=g), torch.zeros(B, mem.N, dtype=torch.long))
+    return mem.replace(bank=torch.randn(B, mem.N, M, IN, generator=g), bank_n=n, bank_t=torch.randint(0, 5, (B, mem.N, M), generator=g), last_write=torch.full((B, mem.N), 3))
+
+
+def test_track_memory_bank():
+    mem = TrackMemory.empty(2, 3, IN, 4, 'cpu', bank_size=3)
+    e0 = torch.randn(2, IN)
+    mem, n = mem.spawn(0, torch.tensor([7, 8]), e0, torch.rand(2, 4), torch.tensor(5))
+    assert n == 2 and mem.bank_n[0].tolist() == [1, 1, 0] and torch.equal(mem.bank[0, 0, -1], e0[0]) and mem.bank_t[0, 1, -1] == 5 and mem.last_write[0].tolist() == [5, 5, 0], \
+        'el banco empieza con el embedding de la primera detección'
+    assert (mem.bank[0, 0, :-1] == 0).all()
+    obs, new = torch.randn(2, 3, IN), torch.randn(2, 3, IN)
+    matched, write = torch.tensor([[True, True, False], [False] * 3]), torch.tensor([[True, False, False], [False] * 3])
+    m2 = mem.push(matched, torch.rand(2, 3, 4), new, torch.tensor([6, 6]), obs, write)
+    assert m2.bank_n[0].tolist() == [2, 1, 0] and torch.equal(m2.bank[0, 0, -1], obs[0, 0]) and torch.equal(m2.bank[0, 0, -2], e0[0]), 'solo escribe el marcado en write y el anterior se desplaza'
+    assert torch.equal(m2.bank[0, 1], mem.bank[0, 1]) and m2.last_write[0].tolist() == [6, 5, 0] and m2.bank_t[0, 0, -1] == 6, 'asignado pero sin escribir: el banco no cambia'
+    for t in range(5):
+        m2 = m2.push(matched, torch.rand(2, 3, 4), new, torch.tensor([7 + t, 7 + t]), obs, matched)
+    assert m2.bank_n[0].tolist() == [3, 3, 0], 'el banco se limita a M'
+    assert m2.kill(torch.tensor([100, 100]), 30).bank_n.sum() == 0 and mem.push(matched, torch.rand(2, 3, 4), new, torch.tensor([6, 6])).bank_n.tolist() == mem.bank_n.tolist(), 'kill vacía el banco; push sin write no lo toca'
+    assert TrackMemory.empty(1, 2, IN, 4, 'cpu').bank is None, 'sin banco: None'
+
+
+def test_history_pool_and_bank_affinity():
+    torch.manual_seed(0)
+    pool = HistoryPool(32, 4).eval()
+    B, N, M = 2, 3, 4
+    a_trk, a_bank = torch.randn(B, N, 32), torch.randn(B, N, M, 32)
+    valid = bank_valid(torch.tensor([[0, 2, 4], [1, 4, 3]]), M)
+    age = torch.randint(0, 20, (B, N, M))
+    out = pool(a_trk, a_bank, age, valid)
+    assert out.shape == (B, N, 32) and torch.isfinite(out).all() and out[0, 0].abs().sum() == 0, 'sin embeddings válidos el resumen es 0'
+    junk = a_bank.clone(); junk[~valid] = torch.randn(int((~valid).sum()), 32) * 9
+    assert torch.allclose(pool(a_trk, junk, age, valid), out, atol=1e-5), 'los huecos de relleno del banco no influyen'
+    assert not torch.allclose(pool(a_trk, a_bank, age + 30, valid)[0, 2], out[0, 2], atol=1e-4), 'la edad de los embeddings influye'
+    assert pool(a_trk[:, :0], a_bank[:, :0], age[:, :0], valid[:, :0]).shape == (B, 0, 32), 'N = 0'
+    a_det = torch.nn.functional.normalize(torch.randn(B, 5, 32), dim=-1)
+    a_t, a_b = torch.nn.functional.normalize(a_trk, dim=-1), torch.nn.functional.normalize(a_bank, dim=-1)
+    smax, ema = bank_affinity(a_det, a_t, a_b, valid, 'max')
+    smean, _ = bank_affinity(a_det, a_t, a_b, valid, 'mean')
+    snone, _ = bank_affinity(a_det, a_t, a_b, valid, 'none')
+    assert smax.shape == (B, 5, N) and (smax >= ema - 1e-6).all() and torch.allclose(snone, ema) and (smax >= smean - 1e-6).all(), 'max >= media; none = solo EMA'
+    assert torch.allclose(bank_affinity(a_det, a_t, a_b, torch.zeros_like(valid), 'max')[0], ema), 'banco vacío: solo la EMA'
+    assert bank_affinity(a_det[:, :0], a_t, a_b, valid)[0].shape == (B, 0, N) and bank_affinity(a_det, a_t[:, :0], a_b[:, :0], valid[:, :0])[0].shape == (B, 5, 0)
+
+
+def test_model_with_bank():
+    m, B, K = _bank_model(), 2, 6
+    for name, alive, nv in (('normal', [3, 5], [4, 6]), ('D=0', [3, 2], [0, 0]), ('T=0', [0, 0], [4, 6]), ('T=1', [1, 1], [4, 6])):
+        mem, dets = _bank_mem(m, B, alive), _dets(B, K, nv)
+        out = m.forward_scores(mem, dets, torch.tensor([5, 5]))
+        _check_out(out, B, K, mem.N)
+        assert out['s_app_ema'].shape == (B, K, mem.N) and torch.isfinite(out['birth_logit']).all(), name
+        new, matched = m.update(mem, m.decide(out), dets, torch.tensor([5, 5]))
+        assert new.bank.shape == mem.bank.shape and not (new.bank_n != mem.bank_n)[~matched].any(), 'solo cambian los asignados'
+    m0 = _bank_model()
+    m0 = _model(max_tracks=0, bank=dict(enabled=True, size=4))
+    out = m0.forward_scores(m0.new_memory(B, 'cpu'), _dets(B, K), torch.tensor([5, 5]))
+    _check_out(out, B, K, 0)
+
+
+def test_bank_padding_invariance():
+    m, B = _bank_model(), 1
+    d_small, mem_small = _dets(B, 4), _bank_mem(m, B, [3])
+    mem_big = _bank_mem(m, B, [3], seed=9)
+    cat = lambda a, b: torch.cat([a[:, :3], b[:, 3:]], 1)
+    mem_big = mem_big.replace(app=cat(mem_small.app, mem_big.app), hist=cat(mem_small.hist, mem_big.hist), bank=cat(mem_small.bank, mem_big.bank), bank_n=cat(mem_small.bank_n, mem_big.bank_n),
+                              bank_t=cat(mem_small.bank_t, mem_big.bank_t))
+    g = torch.Generator().manual_seed(9)
+    d_big = DetTokens(torch.cat([d_small.emb, torch.randn(B, 3, IN, generator=g)], 1), torch.cat([d_small.box, torch.rand(B, 3, 4, generator=g)], 1),
+                      torch.cat([d_small.score, torch.rand(B, 3, generator=g)], 1), torch.tensor([[True] * 4 + [False] * 3]))
+    o1, o2 = m.forward_scores(mem_small, d_small, FRAME), m.forward_scores(mem_big, d_big, FRAME)
+    assert torch.allclose(o1['s'][0, :4, :3], o2['s'][0, :4, :3], atol=1e-4), 'con banco, el relleno de detecciones y huecos no cambia la afinidad de los reales'
+    assert torch.allclose(o1['s_app'][0, :4, :3], o2['s_app'][0, :4, :3], atol=1e-5)
+
+
+def test_bank_write_rules():
+    """Solo escriben los asignados con detección fiable: score >= write_conf, sin solape con otra detección válida (un cruce contamina el embedding) y a un ritmo de al menos write_every frames."""
+    m = _bank_model(write_conf=0.5, write_overlap=0.5, write_every=2)
+    B, K = 1, 5
+    box = torch.tensor([[[0.2, 0.5, 0.1, 0.3], [0.4, 0.5, 0.1, 0.3], [0.6, 0.5, 0.1, 0.3], [0.61, 0.5, 0.1, 0.3], [0.9, 0.5, 0.1, 0.3]]])      # la 2 y la 3 se solapan casi del todo
+    score = torch.tensor([[0.9, 0.2, 0.9, 0.9, 0.9]])
+    dets = DetTokens(torch.randn(B, K, IN), box, score, torch.ones(B, K, dtype=torch.bool))
+    mem = m.new_memory(B, 'cpu')
+    mem, _ = mem.spawn(0, torch.arange(5), torch.randn(5, IN), box[0], torch.tensor(1))
+    lw = mem.last_write.clone(); lw[0, :5] = torch.tensor([1, 1, 1, 1, 9])
+    mem = mem.replace(last_write=lw)                                                                     # el hueco 4 acaba de escribir (frame 9)
+    assign = torch.tensor([[0, 1, 2, 3, 4] + [K] * (mem.N - 5)])
+    new, matched = m.update(mem, assign, dets, torch.tensor([10]))
+    wrote = (new.bank_n[0, :5] - mem.bank_n[0, :5]).tolist()
+    assert matched[0, :5].all() and wrote == [1, 0, 0, 0, 0], f'solo escribe el 0 (score alto, aislado, hace tiempo que no escribe): {wrote}'
+    assert new.last_write[0, 0] == 10 and new.last_write[0, 1] == 1
+
+
+def test_bank_helps_when_the_average_appearance_is_wrong():
+    """La apariencia media (EMA) del track se ha desviado, pero su banco conserva cómo se veía: la afinidad con el banco recupera la pareja y la EMA sola no."""
+    m = _bank_model(affinity='max')
+    B, K = 1, 3
+    dets = _dets(B, K)
+    mem = _bank_mem(m, B, [2])
+    mem = mem.replace(app=torch.randn(1, mem.N, IN) * 3, bank_n=torch.tensor([[1, 1] + [0] * (mem.N - 2)]))      # EMA de otra persona; el banco guarda el embedding de la detección 0 en el track 0
+    bank = mem.bank.clone(); bank[0, 0, -1] = dets.emb[0, 0]
+    out = m.forward_scores(mem.replace(bank=bank), dets, torch.tensor([5]))
+    assert out['s_app'][0, 0, 0] > 0.99 and out['s_app_ema'][0, 0, 0] < 0.6, 'con banco: la pareja correcta tiene coseno 1; solo con la EMA, no'
+    m_none = _bank_model(affinity='none')
+    m_none.load_state_dict(m.state_dict())
+    o2 = m_none.forward_scores(mem.replace(bank=bank), dets, torch.tensor([5]))
+    assert torch.allclose(o2['s_app'], o2['s_app_ema']) and o2['s_app'][0, 0, 0] < 0.6, 'affinity=none ignora el banco en la afinidad (aunque el token siga usándolo)'
+
+
+def test_bank_trains_and_reaches_the_token():
+    from tracking.e2e.train import run_batch
+    with tempfile.TemporaryDirectory() as tmp:
+        batch = _batch(tmp)
+        for h3 in (dict(bank=dict(enabled=True, size=4)), dict(bank=dict(enabled=True, size=4, affinity='none')), dict(bank=dict(enabled=True, size=4), branches=dict(rel=False))):
+            cfg = _cfg(**h3)
+            torch.manual_seed(0)
+            m = H3Model(cfg, IN)
+            loss, st = run_batch(m, batch, cfg, 'cpu', True, 0.5)
+            assert torch.isfinite(loss), h3
+            loss.backward()
+            assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+            pool = [p.grad for p in m.hist_pool.parameters()]
+            if m.use_rel:
+                assert any(g is not None and g.abs().sum() > 0 for g in pool), 'el resumen del historial llega al token y recibe gradiente'
+            else:
+                assert all(g is None for g in pool), 'sin rama relacional el resumen no se usa'
 
 
 def test_build_model_dispatch():
