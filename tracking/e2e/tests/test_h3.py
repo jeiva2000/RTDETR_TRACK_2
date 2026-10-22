@@ -365,6 +365,38 @@ def test_threshold_overrides_reach_the_model():
     assert low[0, 0] == 0 and high[0, 0] == K, 'subir min_prob cambia la decisión sin reconstruir el modelo'
 
 
+def test_loop_breakers():
+    from tracking.e2e.h3.loop_breakers import birth_guard, duplicate_tracks
+    det = torch.tensor([[0.5, 0.5, 0.2, 0.4], [0.5, 0.5, 0.21, 0.4], [0.9, 0.5, 0.1, 0.2]])
+    trk = torch.tensor([[0.5, 0.5, 0.2, 0.4], [0.1, 0.1, 0.1, 0.1]])
+    alive = torch.tensor([True, True])
+    assert birth_guard(det, trk, alive, 0.5).tolist() == [True, True, False], 'las detecciones que solapan con un track vivo no nacen'
+    assert birth_guard(det, trk, torch.tensor([False, True]), 0.5).tolist() == [False] * 3, 'un track muerto no cubre nada'
+    assert birth_guard(det, trk, alive, None).tolist() == [False] * 3 and birth_guard(det, trk, alive, 0.0).tolist() == [False] * 3, 'sin umbral: apagado'
+    assert birth_guard(det[:0], trk, alive, 0.5).shape == (0,) and not birth_guard(det, trk, torch.tensor([False, False]), 0.5).any()
+    boxes = torch.tensor([[0.5, 0.5, 0.2, 0.4], [0.5, 0.5, 0.2, 0.4], [0.5, 0.5, 0.21, 0.4], [0.1, 0.1, 0.1, 0.1]])
+    born, ids = torch.tensor([3, 7, 3, 1]), torch.tensor([10, 11, 12, 13])
+    drop = duplicate_tracks(boxes, torch.ones(4, dtype=torch.bool), born, ids, 0.8)
+    assert drop.tolist() == [False, True, True, False], 'se elimina el más joven de cada pareja solapada (el de born 7; entre born 3 iguales, el de id mayor); el aislado se conserva'
+    assert duplicate_tracks(boxes, torch.tensor([True, True, False, True]), born, ids, 0.8).tolist() == [False, True, False, False], 'los muertos no cuentan'
+    assert not duplicate_tracks(boxes, torch.ones(4, dtype=torch.bool), born, ids, None).any()
+    assert not duplicate_tracks(boxes[:1], torch.ones(1, dtype=torch.bool), born[:1], ids[:1], 0.8).any(), 'un solo track: nada que eliminar'
+
+
+def test_sweep_grid_h3_knobs():
+    from tracking.e2e import sweep as W
+    g = W.make_grid_h3([0.5], [0.6], [0.0, 0.5], [0.0, 0.85], [None, 0.5])
+    assert len(g) == 6 and len({W.cfg_id(c) for c in g}) == 6, 'cada configuración tiene un identificador distinto'
+    assert not any(c['dedupe'] and not c['guard'] for c in g), 'la eliminación de duplicados nunca se prueba sin la guarda de nacimientos'
+    assert W.cfg_id(g[0]) == 'h3_thr0.5_s0.6' and W.make_grid_h3([0.5], [0.6]) == [dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None)]
+    m = _model()
+    trained = m.hc.det_thr
+    W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.5, dedupe=0.85, det_thr=0.5), 'cpu')
+    assert (m.hc.birth_guard_iou, m.hc.dedupe_iou, m.hc.det_thr) == (0.5, 0.85, 0.5)
+    W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None), 'cpu')
+    assert (m.hc.birth_guard_iou, m.hc.dedupe_iou, m.hc.det_thr) == (None, None, trained), 'una configuración no arrastra los valores de la anterior'
+
+
 def test_build_model_dispatch():
     assert isinstance(build_model(load_config(None, None), IN), E2EModel)
     assert isinstance(build_model(_cfg(), IN), H3Model)

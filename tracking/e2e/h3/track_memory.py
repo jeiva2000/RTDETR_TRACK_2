@@ -40,10 +40,14 @@ class TrackMemory:
         d.update(kw)
         return TrackMemory(**d)
 
+    def drop(self, dead):
+        """Elimina los tracks marcados en dead (B,N)."""
+        dead = dead & self.alive
+        return self.replace(alive=self.alive & ~dead, ids=torch.where(dead, -torch.ones_like(self.ids), self.ids), hist_len=torch.where(dead, torch.zeros_like(self.hist_len), self.hist_len))
+
     def kill(self, frame, max_age):
         """Elimina los tracks con más de max_age frames sin asignar."""
-        dead = self.alive & (self.gap(frame) > max_age)
-        return self.replace(alive=self.alive & ~dead, ids=torch.where(dead, -torch.ones_like(self.ids), self.ids), hist_len=torch.where(dead, torch.zeros_like(self.hist_len), self.hist_len))
+        return self.drop(self.alive & (self.gap(frame) > max_age))
 
     def spawn(self, b, ids, app0, boxes, frame_b):
         """Crea tracks nuevos en los primeros huecos libres del clip b. ids (n,), app0 (n,in_dim), boxes (n,4). Devuelve (memoria, nº creados)."""

@@ -20,7 +20,9 @@
 #                  curva de la probabilidad frente al umbral h3.min_prob, caja predicha frente a la última caja, causas de los cambios de ID y nacimientos, IDs creados;
 #        teacher = la memoria se actualiza con la asignación GT (estado siempre limpio): calidad pura de la decisión, sin acumulación de errores.
 #      Comparar closed con teacher separa «el modelo decide mal» de «los errores se acumulan». Al final del informe van pistas heurísticas (orientan, no demuestran).
-#   3. Re-barrido con métricas reales (HOTA, AssA, IDF1, IDSW) variando h3.min_prob y h3.new_thr sobre una COPIA de la evaluación (no pisa eval/seed_run); DIAG_RESWEEP=0 lo omite.
+#   2b. Segundo diagnóstico, solo closed, con los mecanismos contra el bucle de duplicados activos (DIAG_LB_OVERRIDES): compara IDs creados, cambios de ID y acierto con y sin ellos.
+#   3. Re-barrido con métricas reales (HOTA, AssA, IDF1, IDSW) variando h3.min_prob, h3.new_thr y los mecanismos contra duplicados (guarda de nacimientos h3.birth_guard_iou y
+#      eliminación del track más joven h3.dedupe_iou, tracking/e2e/h3/loop_breakers.py) sobre una COPIA de la evaluación (no pisa eval/seed_run); DIAG_RESWEEP=0 lo omite.
 # Salidas: $OUTPUT_ROOT/e2e_unfrozen_<variante>/diagnose/{report.md,report.json,sweep/...} y una copia del informe en $OUTPUT_ROOT/h3_diagnose_report.md (también en el log del trabajo).
 #
 # USO, desde la RAÍZ del repo:   cd ~/work/RTDETR_TRACK_2 && git pull && sbatch slurm/h3_diagnose.slurm
@@ -43,8 +45,12 @@ DIAG_SEQS="${DIAG_SEQS:-}"                              # secuencias de val a us
 DIAG_MAX_SEQS="${DIAG_MAX_SEQS:-0}"                     # 0 = todas; N = solo las N primeras (prueba rápida)
 DIAG_OVERRIDES="${DIAG_OVERRIDES:-}"                    # sobrescribe claves de la configuración del checkpoint en el diagnóstico, p. ej. "h3.min_prob=0.3 h3.new_thr=0.5"
 DIAG_RESWEEP="${DIAG_RESWEEP:-1}"                       # 1 = re-barrido con métricas reales (paso 3); 0 = solo el diagnóstico
-DIAG_MIN_PROB="${DIAG_MIN_PROB:-0.1 0.3 0.5}"           # umbrales de probabilidad h3.min_prob del re-barrido (el entrenado/evaluado fue 0.5)
+DIAG_MIN_PROB="${DIAG_MIN_PROB:-0.5}"                   # umbrales de probabilidad h3.min_prob del re-barrido (el evaluado en e2e.slurm fue 0.5)
 DIAG_SCORES="${DIAG_SCORES:-0.6}"                       # umbrales de score de nacimiento h3.new_thr del re-barrido
+DIAG_GUARD="${DIAG_GUARD:-0 0.3 0.5}"                   # h3.birth_guard_iou del re-barrido: no nace una detección cubierta por un track vivo (IoU >= valor); 0 = apagado
+DIAG_DEDUPE="${DIAG_DEDUPE:-0 0.85}"                    # h3.dedupe_iou del re-barrido: se elimina el track más joven de dos solapados (IoU >= valor); 0 = apagado. Solo se prueba junto con la guarda
+DIAG_DET_THR="${DIAG_DET_THR:-}"                        # h3.det_thr de la inferencia en el re-barrido (vacío = el del entrenamiento, 0.3); p. ej. "0.3 0.5"
+DIAG_LB_OVERRIDES="${DIAG_LB_OVERRIDES-h3.birth_guard_iou=0.3 h3.dedupe_iou=0.85}"   # paso 2b: configuración con los mecanismos activos; vacío (DIAG_LB_OVERRIDES=) omite el paso
 # --- Entorno del clúster y de conda (aquí NO se crea el entorno: lo crea slurm/e2e.slurm) ---
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 CLUSTER_MODULES="${CLUSTER_MODULES:-GCC/12.2.0 CUDA/11.8.0}"
@@ -86,23 +92,45 @@ else
 fi
 
 echo; echo "[paso 2] diagnóstico (modos: $DIAG_MODES)"
-EXTRA=(); [ -n "$DIAG_SEQS" ] && EXTRA+=(--seqs $DIAG_SEQS); [ "$DIAG_MAX_SEQS" != "0" ] && EXTRA+=(--max-seqs "$DIAG_MAX_SEQS"); [ -n "$DIAG_OVERRIDES" ] && EXTRA+=(-u $DIAG_OVERRIDES)
-python -m tracking.e2e.h3.diagnose run --ckpt "$RUN/e2e_best.pth" --cache "$FEAT" --out "$DIAG" --modes $DIAG_MODES ${EXTRA[@]+"${EXTRA[@]}"}
+SEQARGS=(); [ -n "$DIAG_SEQS" ] && SEQARGS+=(--seqs $DIAG_SEQS); [ "$DIAG_MAX_SEQS" != "0" ] && SEQARGS+=(--max-seqs "$DIAG_MAX_SEQS")
+python -m tracking.e2e.h3.diagnose run --ckpt "$RUN/e2e_best.pth" --cache "$FEAT" --out "$DIAG" --modes $DIAG_MODES ${SEQARGS[@]+"${SEQARGS[@]}"} ${DIAG_OVERRIDES:+-u $DIAG_OVERRIDES}
 { echo; echo "## Entrenamiento (log.txt)"; echo; cat "$DIAG/training_logs.md"; } >> "$DIAG/report.md"
+
+if [ -n "$DIAG_LB_OVERRIDES" ]; then
+  echo; echo "[paso 2b] diagnóstico en closed con los mecanismos contra duplicados: $DIAG_LB_OVERRIDES"
+  python -m tracking.e2e.h3.diagnose run --ckpt "$RUN/e2e_best.pth" --cache "$FEAT" --out "$DIAG/with_loop_breakers" --modes closed ${SEQARGS[@]+"${SEQARGS[@]}"} -u ${DIAG_OVERRIDES:-} $DIAG_LB_OVERRIDES > /dev/null
+  python - "$DIAG/report.json" "$DIAG/with_loop_breakers/report.json" "$DIAG_LB_OVERRIDES" <<'PYEOF' | tee -a "$DIAG/report.md"
+import json, sys
+a, b = (json.load(open(f)).get('closed') for f in sys.argv[1:3])
+if a is None:
+    sys.exit(0)
+def row(name, r):
+    d, ic, ids, bi, lb = r['decisions_present'], r['id_changes'], r['ids'], r['births'], r['loop_breakers']
+    return (f"| {name} | {ids['predicted']} ({ids['ratio']:.1f}x) | {ic['total']} | {d['correct']:.1%} | {d['missed']:.1%} | {d['swap_to_other_id']:.1%} | {bi.get('lost_no_slot', 0)} | "
+            f"{r['detections']['tracks_alive_per_frame']:.1f} | {lb['births_guarded']} / {lb['dedupe_dropped']} |")
+print('\n## Efecto de los mecanismos contra duplicados (modo closed, mismas decisiones del modelo)\n')
+print(f'Configuración añadida: `{sys.argv[3]}`\n')
+print('| | IDs predichos (frente al GT) | cambios de ID | tracks correctos | rechazados | enlace a otra identidad | nacimientos perdidos (sin hueco) | tracks vivos por frame | guardados / eliminados |')
+print('|---|---|---|---|---|---|---|---|---|')
+print(row('como se entrenó/evaluó', a)); print(row('con mecanismos', b))
+PYEOF
+  cp "$DIAG/report.md" "$OUTPUT_ROOT/h3_diagnose_report.md"
+fi
 cp "$DIAG/report.md" "$OUTPUT_ROOT/h3_diagnose_report.md"
 
 if [ "$DIAG_RESWEEP" = "1" ]; then
-  echo; echo "[paso 3] re-barrido con métricas reales: h3.min_prob = $DIAG_MIN_PROB × h3.new_thr = $DIAG_SCORES (sobre una copia: no se pisa eval/seed_run)"
+  echo; echo "[paso 3] re-barrido con métricas reales: h3.min_prob = $DIAG_MIN_PROB × h3.new_thr = $DIAG_SCORES × guarda = $DIAG_GUARD × dedupe = $DIAG_DEDUPE (sobre una copia: no se pisa eval/seed_run)"
   SR="$RUN/eval/seed_run_diag"; rm -rf "$SR"; mkdir -p "$SR"; cp "$RUN/e2e_best.pth" "$SR/best.pth"
-  python -m tracking.e2e.sweep run --runs "$SR" --ckpt-name best.pth --cache "$FEAT" --gt-root "$VAL" --out "$DIAG/sweep" --sweep-seeds 1 --min-prob $DIAG_MIN_PROB --score $DIAG_SCORES
+  python -m tracking.e2e.sweep run --runs "$SR" --ckpt-name best.pth --cache "$FEAT" --gt-root "$VAL" --out "$DIAG/sweep" --sweep-seeds 1 --min-prob $DIAG_MIN_PROB --score $DIAG_SCORES --guard-iou $DIAG_GUARD --dedupe-iou $DIAG_DEDUPE ${DIAG_DET_THR:+--det-thr $DIAG_DET_THR}
   python - "$DIAG/sweep/sweep.json" "$RUN/eval/seed_run/best_infer.json" <<'PYEOF' | tee -a "$DIAG/report.md" | tee -a "$OUTPUT_ROOT/h3_diagnose_report.md"
 import json, os, sys
 res = json.load(open(sys.argv[1]))
-print('\n## Re-barrido con métricas reales (una semilla; umbrales elegidos y reportados sobre val)\n')
-print('| h3.min_prob | h3.new_thr | HOTA | DetA | AssA | IDF1 | IDSW |\n|---|---|---|---|---|---|---|')
-for r in sorted(res, key=lambda r: (r['cfg']['birth_thr'], r['cfg']['min_score'])):
-    m = r['mean']
-    print(f"| {r['cfg']['birth_thr']} | {r['cfg']['min_score']} | {m['HOTA']:.1f} | {m['DetA']:.1f} | {m['AssA']:.1f} | {m['IDF1']:.1f} | {m['IDSW']:.0f} |")
+print('\n## Re-barrido con métricas reales (ordenado por HOTA; una semilla; umbrales elegidos y reportados sobre val)\n')
+print('| h3.min_prob | h3.new_thr | guarda IoU | dedupe IoU | det_thr | HOTA | DetA | AssA | IDF1 | IDSW |\n|---|---|---|---|---|---|---|---|---|---|')
+for r in sorted(res, key=lambda r: -r['mean']['HOTA']):
+    c, m = r['cfg'], r['mean']
+    print(f"| {c['birth_thr']} | {c['min_score']} | {c.get('guard') or 'off'} | {c.get('dedupe') or 'off'} | {c['det_thr'] if c.get('det_thr') is not None else 'entrenado'} | "
+          f"{m['HOTA']:.1f} | {m['DetA']:.1f} | {m['AssA']:.1f} | {m['IDF1']:.1f} | {m['IDSW']:.0f} |")
 if os.path.isfile(sys.argv[2]):
     print('\nConfiguración elegida en la evaluación de e2e.slurm (referencia):', open(sys.argv[2]).read())
 PYEOF

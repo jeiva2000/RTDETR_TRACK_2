@@ -28,6 +28,7 @@ DEFAULTS = {
         'noise': {'jitter_pos': 0.05, 'jitter_scale': 0.05, 'p_fp': 0.03},   # el drop es train.p_fn
         'new_thr': 0.6,                                              # score mínimo de una detección sin asignar para crear un track (inferencia)
         'min_prob': 0.5,                                             # inferencia: una pareja del Hungarian se acepta si su probabilidad de Sinkhorn P_ij >= min_prob
+        'birth_guard_iou': None, 'dedupe_iou': None,                 # inferencia, rompen el bucle de duplicados (h3/loop_breakers.py); None = apagado. dedupe_iou solo junto con birth_guard_iou
     },
     'ablation': {},                                                  # banderas de ablación de hitos posteriores
 }

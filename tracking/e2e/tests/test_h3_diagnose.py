@@ -76,6 +76,35 @@ def test_forced_failure_is_detected_and_attributed():
         assert any('umbral' in h for h in D.hints(dict(closed=bad)))
 
 
+def test_loop_breakers_cut_the_duplicate_loop_in_inference_and_diagnosis():
+    """Con un umbral de probabilidad imposible (todo rechazado) cada detección nace como ID nuevo: la guarda de nacimientos y la supresión de duplicados deben cortarlo, tanto en la
+    inferencia real (h3/infer.py) como en el diagnóstico, que comparten los mecanismos."""
+    from tracking.e2e.h3 import infer as I
+    with tempfile.TemporaryDirectory() as tmp:
+        model, cfg, _ = _trained(tmp)
+        seq = torch.load(f'{tmp}/val/cache/va00.pt')
+        deep_update(cfg, {'h3': {'min_prob': 0.9999}})
+        base = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
+        rows0, _ = I.track_sequence(model, seq, cfg, 'cpu')
+        deep_update(cfg, {'h3': {'birth_guard_iou': 0.5}})
+        guarded = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
+        rows1, _ = I.track_sequence(model, seq, cfg, 'cpu')
+        _check_invariants(guarded)
+        assert guarded['loop_breakers']['births_guarded'] > 0 and base['loop_breakers']['births_guarded'] == 0
+        assert guarded['ids']['ratio'] < 0.9 * base['ids']['ratio'], f"la guarda debe reducir los IDs creados: {base['ids']['ratio']:.2f} -> {guarded['ids']['ratio']:.2f}"   # no los elimina: con todo rechazado los tracks no se actualizan y su caja predicha se aleja
+        assert len({r[1] for r in rows1}) < len({r[1] for r in rows0}), 'y también en la inferencia real'
+        deep_update(cfg, {'h3': {'birth_guard_iou': None, 'dedupe_iou': 0.8}})
+        alone = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
+        assert alone['loop_breakers']['dedupe_dropped'] > 0 and alone['ids']['ratio'] > base['ids']['ratio'], 'dedupe SOLO empeora (el eliminado renace): por eso el barrido no lo prueba sin guarda'
+        deep_update(cfg, {'h3': {'birth_guard_iou': 0.3, 'dedupe_iou': 0.8}})
+        both = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
+        _check_invariants(both)
+        assert both['ids']['ratio'] < guarded['ids']['ratio'] <= base['ids']['ratio'] and both['id_changes']['total'] < base['id_changes']['total'], 'guarda (0.3) + dedupe reducen IDs y cambios de ID'
+        deep_update(cfg, {'h3': {'birth_guard_iou': None, 'dedupe_iou': None}})
+        again = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
+        assert again['ids'] == base['ids'] and again['counts'] == base['counts'], 'apagados, el comportamiento vuelve a ser exactamente el anterior'
+
+
 def test_summarize_logs():
     with tempfile.TemporaryDirectory() as tmp:
         for name, recs in (('e2e_unfrozen_h1', [dict(epoch=0, val_acc=0.5, val_acc_present=0.6, val_loss=1.0, deta_ok=True), dict(epoch=1, val_acc=0.9, val_acc_present=0.95, val_loss=0.4, deta_ok=True),

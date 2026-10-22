@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from tracking.e2e.config import deep_update, load_config, parse_overrides
 from tracking.e2e.h3.geometry import giou
+from tracking.e2e.h3.loop_breakers import birth_guard, duplicate_tracks
 from tracking.e2e.heads import box_iou_b
 from tracking.e2e.model import build_model
 from tracking.e2e.tokens import from_cache
@@ -121,6 +122,10 @@ def run_sequence(model, cfg, d, device, mode, S):
             j = int(assign[i]); used[j] = True
             events.append((int(tid[j]), int(ids_before[i]), 'link', int(gt_slot[i])))
         mem = mem.kill(frame, cfg.state.max_age)
+        if mode == 'closed':                                          # mismos mecanismos que la inferencia (apagados salvo h3.dedupe_iou / h3.birth_guard_iou)
+            dup = duplicate_tracks(mem.hist[0, :, -1], mem.alive[0], mem.born[0], mem.ids[0], cfg.h3.dedupe_iou)
+            c['loop_dedupe_dropped'] += int(dup.sum())
+            mem = mem.drop(dup[None])
         alive_now = mem.alive[0].cpu().numpy()
         gt_slot[~alive_now] = -1
         if mode == 'closed':
@@ -130,7 +135,10 @@ def run_sequence(model, cfg, d, device, mode, S):
                     if prev is not None and prev != trk:
                         c['idchg_swap_link' if slot_gt != g else 'idchg_switch_back'] += 1
                     last_tid[g] = trk
-            cand = (~used) & dv & (sc[t].cpu().numpy() >= cfg.h3.new_thr)
+            guard = birth_guard(box[t], out['box_pred'][0], mem.alive[0], cfg.h3.birth_guard_iou).cpu().numpy()
+            cand0 = (~used) & dv & (sc[t].cpu().numpy() >= cfg.h3.new_thr)
+            c['loop_births_guarded'] += int((cand0 & guard).sum())
+            cand = cand0 & ~guard
             taken = box[t][torch.from_numpy(used).to(device)]
             for j in np.argsort(-sc[t].cpu().numpy()):
                 if not cand[j]:
@@ -209,6 +217,7 @@ def summarize(S, mode):
         tot = sum(chg.values())
         r['id_changes'] = dict(total=tot, by_cause=chg, share={k: rate(v, tot) for k, v in chg.items()})
         r['births'] = {k[len('births_'):]: v for k, v in c.items() if k.startswith('births_')}
+        r['loop_breakers'] = dict(births_guarded=c['loop_births_guarded'], dedupe_dropped=c['loop_dedupe_dropped'])
         r['ids'] = dict(predicted=c['ids_pred'], gt=c['ids_gt'], ratio=rate(c['ids_pred'], c['ids_gt']))
     return r
 
@@ -288,6 +297,9 @@ def to_markdown(rep, meta):
             L.append(f"**IDs**: {ids['predicted']} predichos frente a {ids['gt']} en el GT (x{ids['ratio']:.2f})\n")
             L.append(f"**Cambios de ID** (total {ic['total']}): " + ' · '.join(f"{k} {v} ({fmt(ic['share'][k])})" for k, v in sorted(ic['by_cause'].items(), key=lambda kv: -kv[1])) + '\n')
             L.append('**Nacimientos**: ' + ' · '.join(f'{k} {v}' for k, v in b.items()) + '\n')
+            lb = r['loop_breakers']
+            if lb['births_guarded'] or lb['dedupe_dropped']:
+                L.append(f"**Mecanismos contra duplicados activos**: nacimientos evitados por la guarda {lb['births_guarded']} · tracks duplicados eliminados {lb['dedupe_dropped']}\n")
     return '\n'.join(L)
 
 
