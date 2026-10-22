@@ -5,7 +5,7 @@ detector va en eval (BatchNorm con estadísticas fijas: con lotes de frames de u
 Pérdida = detección completa de RT-DETRv2 sobre los frames del clip + lambda_e2e * pérdida e2e con gradiente hacia el detector a través de los embeddings
 (cajas y scores se desconectan). Grupos de parámetros: decoder a --lr-det (2e-5), encoder a --lr-encoder (por defecto = --lr-det), backbone a --lr-backbone (por defecto
 --lr-det / 10, la misma proporción que RT-DETRv2: 1e-4 / 1e-5; sin validar) y módulo a train.lr de la config; un único recorte de gradiente (--clip-det) para el detector.
-Control del detector: DetA en val cada época (por defecto la media de los umbrales 0.5/0.6/0.7, que es menos sensible a desplazamientos de calibración de
+Control del detector (parada opcional con train.deta_stop=false / --no-deta-stop: entonces solo se registra y el mejor checkpoint se elige entre todas las épocas): DetA en val cada época (por defecto la media de los umbrales 0.5/0.6/0.7, que es menos sensible a desplazamientos de calibración de
 los scores que un solo umbral); si cae más de --deta-tol puntos por debajo del DetA inicial, se informa y se detiene. Con módulo desde cero, los primeros
 --det-freeze-steps pasos solo aprende el módulo (todo el detector a lr 0).
 DDP (varias GPUs): cada proceso (una GPU) procesa --clips-per-gpu clips distintos por paso (DistributedSampler) y los gradientes se sincronizan con DDP (el backbone y el
@@ -139,7 +139,7 @@ def main(a):
     @torch.no_grad()
     def eval_live():
         model.eval()
-        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0, motion_sum=0.0, n_motion=0)
+        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0)
         for i in range(rank, len(val_ds), world):          # cada proceso evalúa sus clips (rank::world) y se suman los recuentos
             c = val_ds[i]
             lg, bx, em = extract_eval(c['images'].to(dev))
@@ -149,11 +149,12 @@ def main(a):
                          frames=c['frames'][None], cross=[None])
             _, s = run_batch(model, batch, cfg, dev, False, 1.0)
             for k in tot:
-                tot[k] += s[k]
+                tot[k] += s.get(k, 0)
         model.train(); det.set_train(True)
         tot = du.sum_dicts(tot)
         return dict(acc=tot['ok'] / max(tot['n'], 1), acc_present=tot['ok_present'] / max(tot['present'], 1),
-                    loss=tot['assoc_sum'] / max(tot['n'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1), motion_nll=tot['motion_sum'] / max(tot['n_motion'], 1))
+                    loss=tot['assoc_sum'] / max(tot['n'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1), motion_nll=tot['motion_sum'] / max(tot['n_motion'], 1),
+                    ids_ratio=tot['births'] / tot['gt_ids'] if tot['gt_ids'] else None)    # IDs creados / identidades GT (solo H3; con bucle cerrado mide la fragmentación)
 
     with torch.no_grad():
         d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
@@ -163,6 +164,7 @@ def main(a):
     P(f'inicial: DetA({a.deta_metric})={c0:.2f} por umbral={ {k: round(x, 2) for k, x in d0.get("DetA_by_thr", {}).items()} } '
       f'val_acc(asignación)={v0["acc"]:.4f}', flush=True)
     best_acc, step, t_start, stop_reason = -1.0, 0, time.time(), None
+    deta_stop = bool(cfg.train.deta_stop) if a.deta_stop is None else a.deta_stop          # parar si el DetA cae más de --deta-tol; con False se entrena todas las épocas
     for ep in range(a.epochs):
         train_ds.seed = a.seed + ep
         ss_ep = cfg.train.ss_max * min(1.0, ep / ss_warmup) if ss_warmup else cfg.train.ss_max
@@ -203,10 +205,10 @@ def main(a):
         ok = bool(du.broadcast_object(cv >= c0 - a.deta_tol))     # la decisión de parar la toma rank 0 y es la misma en todos: si no, unos procesos salen del bucle y otros siguen (DDP se bloquea)
         parts = {f'train_{k}': x / max(run['n'], 1) for k, x in pr.items()}                  # e2e sin ponderar, por partes
         nb_name, nm_name = val_names(cfg)                                                      # H1/H2: birth_loss, motion_nll; H3: app_loss, motion_loss
-        vparts = {f'val_{nb_name}': v['birth_loss'], **({f'val_{nm_name}': v['motion_nll']} if has_motion(cfg) else {})}
+        vparts = {f'val_{nb_name}': v['birth_loss'], **({f'val_{nm_name}': v['motion_nll']} if has_motion(cfg) else {}), **({'val_ids_ratio': v['ids_ratio']} if cfg.h3.enabled else {})}
         rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), **parts, DetA=d['DetA'], DetA_control=cv,
                    DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), n_det=d['n_det'],
-                   val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], **vparts, deta_ok=bool(ok), time=time.time() - t0)
+                   val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], **vparts, deta_ok=bool(ok), ss=ss_ep, time=time.time() - t0)
         P(json.dumps(rec), flush=True)
         if a.check_sync and world > 1:      # las réplicas deben seguir idénticas tras el paso del optimizador (detector completo + módulo: no solo lo registrado en JointModule)
             sums = du.all_gather_object(du.params_checksum(det.model) + du.params_checksum(model))
@@ -216,12 +218,14 @@ def main(a):
         if main_proc:
             open(os.path.join(a.out, 'log.txt'), 'a').write(json.dumps(rec) + '\n')
             torch.save({'model': det.model.state_dict()}, os.path.join(a.out, 'detector_last.pth')); torch.save(e2e_state, os.path.join(a.out, 'e2e_last.pth'))
-        if ok and v['acc'] > best_acc:
+        if (ok or not deta_stop) and v['acc'] > best_acc:                  # sin parada por DetA, toda época puede ser la mejor (el DetA queda registrado en el log)
             best_acc = v['acc']
             if main_proc:
                 torch.save({'model': det.model.state_dict()}, os.path.join(a.out, 'detector_best.pth')); torch.save(e2e_state, os.path.join(a.out, 'e2e_best.pth'))
         du.barrier()
-        if not ok:
+        if not ok and not deta_stop:
+            P(f'AVISO: DetA ({a.deta_metric}) {cv:.2f} está {c0 - cv:.2f} por debajo del inicial ({c0:.2f}); no se detiene (train.deta_stop=false).', flush=True)
+        if not ok and deta_stop:
             kept = (f'best = mejor época anterior ({best_acc:.4f} de val_acc).' if best_acc >= 0 else
                     'NINGUNA época fue válida: no hay *_best.pth; el punto de partida sigue siendo lo mejor.')
             stop_reason = f'DetA ({a.deta_metric}) cayó a {cv:.2f} (inicial {c0:.2f}, tolerancia {a.deta_tol}) en la época {ep}. Se detiene; {kept}'
@@ -259,6 +263,8 @@ if __name__ == '__main__':
     p.add_argument('--amp', choices=['fp16', 'bf16', 'none'], default='fp16'); p.add_argument('--no-flip', action='store_true')
     p.add_argument('--deta-thr', type=float, default=0.6); p.add_argument('--deta-extra-thrs', type=float, nargs='*', default=[0.5, 0.7])
     p.add_argument('--deta-stride', type=int, default=4); p.add_argument('--deta-tol', type=float, default=0.5)
+    p.add_argument('--deta-stop', action=argparse.BooleanOptionalAction, default=None,
+                   help='parar el entrenamiento si el DetA cae más de --deta-tol (por defecto lo dicta train.deta_stop de la config, True; --no-deta-stop entrena todas las épocas)')
     p.add_argument('--deta-metric', choices=['mean', 'thr'], default='mean', help='mean = media de los umbrales; thr = solo --deta-thr')
     p.add_argument('--eval-seqs', nargs='*', default=None); p.add_argument('--val-clips', type=int, default=100)
     p.add_argument('--num-workers', type=int, default=8); p.add_argument('--print-freq', type=int, default=20)

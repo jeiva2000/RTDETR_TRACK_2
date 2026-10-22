@@ -100,19 +100,21 @@ def has_motion(cfg):
 
 def evaluate(model, ds, cfg, device):
     model.eval()
-    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, motion_sum=0.0, n_motion=0)
+    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0)
     bs = cfg.train.batch
     with torch.no_grad():
         for i in range(0, len(ds), bs):
             _, s = run_batch(model, collate([ds[j] for j in range(i, min(i + bs, len(ds)))]), cfg, device, False, 1.0)
             for k in tot:
-                tot[k] += s[k]
+                tot[k] += s.get(k, 0)
     model.train()
     nb_name, nm_name = val_names(cfg)
     out = {'loss': tot['assoc_sum'] / max(tot['n'], 1), 'acc': tot['ok'] / max(tot['n'], 1),
            'acc_present': tot['ok_present'] / max(tot['present'], 1), nb_name: tot['birth_sum'] / max(tot['n_birth'], 1)}
     if tot['n_motion']:
         out[nm_name] = tot['motion_sum'] / tot['n_motion']
+    if tot['gt_ids']:
+        out['ids_ratio'] = tot['births'] / tot['gt_ids']     # IDs creados / identidades GT (solo H3)
     if tot['cross']:
         out['acc_cross'] = tot['ok_cross'] / tot['cross']
     if tot['overflow']:

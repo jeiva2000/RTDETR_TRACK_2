@@ -12,7 +12,7 @@ DEFAULTS = {
     'motion': {'mode': 'none', 'dim': 128, 'hidden': 128, 'vel_scale': 10.0},   # H2: mode none | gru (segundo vector por track con σ)
     'loss': {'w_assoc': 1.0, 'w_birth': 1.0, 'w_motion': 1.0, 'birth_pos_weight': 1.0, 'birth_detach': True},   # birth_detach: el gradiente del nacimiento no llega a la proyección compartida
     'train': {'T': 10, 'burn_in': 0, 'ss_max': 0.5, 'ss_warmup': 5, 'p_fn': 0.1, 'lr': 1e-3, 'weight_decay': 1e-4,
-              'epochs': 20, 'batch': 8, 'samples_per_epoch': 2000, 'val_samples': 300, 'clip_grad': 1.0,
+              'epochs': 20, 'deta_stop': True, 'batch': 8, 'samples_per_epoch': 2000, 'val_samples': 300, 'clip_grad': 1.0,
               'max_stride': 3, 'p_skip': 0.2, 'max_skip': 5},
     'infer': {'birth_mode': 'head', 'birth_thr': 0.5, 'birth_nms': 0.7, 'min_score': 0.0},   # birth_mode: head | score
     'h3': {                                                          # H3: asociación relacional (tracking/e2e/h3/); h3.enabled=true lo activa en lugar de E2EModel
@@ -26,6 +26,7 @@ DEFAULTS = {
         'memory': {'app_update': 'ema', 'alpha': 0.1, 'edges': False, 'edge_dim': 32},   # app_update: ema | gate; edges: memoria de aristas (fase 2)
         'loss': {'w_motion': 1.0, 'w_app': 1.0, 'tau_app': 0.1},     # L = L_assign + w_motion·L_motion + w_app·L_app
         'noise': {'jitter_pos': 0.05, 'jitter_scale': 0.05, 'p_fp': 0.03},   # el drop es train.p_fn
+        'closed_loop': True,                                         # entrenamiento: cada clip, con probabilidad ss (rampa por épocas), corre en bucle cerrado (decisiones y nacimientos del modelo); False = receta anterior
         'new_thr': 0.6,                                              # score mínimo de una detección sin asignar para crear un track (inferencia)
         'min_prob': 0.5,                                             # inferencia: una pareja del Hungarian se acepta si su probabilidad de Sinkhorn P_ij >= min_prob
         'birth_guard_iou': None, 'dedupe_iou': None,                 # inferencia, rompen el bucle de duplicados (h3/loop_breakers.py); None = apagado. dedupe_iou solo junto con birth_guard_iou

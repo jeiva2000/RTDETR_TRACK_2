@@ -92,6 +92,21 @@ def test_train_joint_unfreezes_by_default_and_flags_freeze():
         assert rec['DetA'] >= 0
 
 
+def test_deta_stop_is_optional():
+    """Con una tolerancia imposible (el DetA nunca la cumple) el entrenamiento por defecto se detiene tras la 1.ª época; con --no-deta-stop sigue todas las épocas y guarda un mejor checkpoint."""
+    with tempfile.TemporaryDirectory() as tmp:
+        make_sequence(tmp + '/train', 'seqA'); make_sequence(tmp + '/val', 'seqB')
+        _detector(tmp)
+        base = ['--epochs', '2', '--deta-tol', '-1000', '--no-train-backbone', '--no-train-encoder']
+        out, stdout = _run(tmp, base)
+        assert len(open(out + '/log.txt').read().splitlines()) == 1 and 'PARADA' in stdout, 'por defecto: se detiene tras la 1.ª época'
+        assert not os.path.isfile(out + '/e2e_best.pth'), 'ninguna época válida: no hay mejor checkpoint'
+        out, stdout = _run(tmp, base + ['--no-deta-stop'])
+        recs = [json.loads(l) for l in open(out + '/log.txt')]
+        assert len(recs) == 2 and 'PARADA' not in stdout and 'AVISO: DetA' in stdout and all(not r['deta_ok'] for r in recs), 'sin parada: se entrenan las dos épocas y se avisa del DetA'
+        assert os.path.isfile(out + '/e2e_best.pth') and os.path.isfile(out + '/detector_best.pth'), 'sin parada, el mejor checkpoint se elige entre todas las épocas'
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     for t in tests:

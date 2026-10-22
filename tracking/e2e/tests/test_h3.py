@@ -397,6 +397,57 @@ def test_sweep_grid_h3_knobs():
     assert (m.hc.birth_guard_iou, m.hc.dedupe_iou, m.hc.det_thr) == (None, None, trained), 'una configuración no arrastra los valores de la anterior'
 
 
+def test_clip_targets_with_duplicates_and_false_positive_slots():
+    """Objetivos por identidad GT de cada hueco: con duplicados la detección es del más antiguo y el otro va al dustbin; un hueco de falso positivo va siempre al dustbin."""
+    from tracking.e2e.h3.train import clip_targets
+    N, K = 4, 4
+    gt, born = torch.tensor([[5, 5, 7, -1]]), torch.tensor([[2, 1, 3, 0]])                     # los huecos 0 y 1 son duplicados de la identidad 5 (el 1 nació antes); el 3 es un falso positivo
+    tid, dv, tv = torch.tensor([[5, 7, 9, -1]]), torch.ones(1, K, dtype=torch.bool), torch.ones(1, N, dtype=torch.bool)
+    td, tt, ht, hd = clip_targets(gt, born, tid, dv, tv, K, N)
+    assert td.tolist() == [[1, 2, N, N]], 'la identidad 5 la recibe el hueco más antiguo (1); la 9 no tiene track y el falso positivo tampoco: dustbin'
+    assert tt.tolist() == [[K, 0, 1, K]], 'el duplicado (hueco 0) y el hueco de falso positivo (3) van al dustbin; los otros reciben su detección'
+    assert ht.tolist() == [[True, True, False, False]] and hd.tolist() == [[False, True, True, False]]
+    td2, tt2, _, _ = clip_targets(torch.tensor([[5, 5, 7, -1]]), torch.tensor([[1, 1, 3, 0]]), tid, dv, tv, K, N)
+    assert td2.tolist()[0][0] == 0, 'empate de edad: el menor índice'
+    td3, tt3, _, _ = clip_targets(gt, born, tid, torch.tensor([[False, True, True, True]]), tv, K, N)
+    assert td3.tolist()[0][0] == N and tt3.tolist() == [[K, K, 1, K]], 'una detección no válida no recibe ni cede nada'
+    td4, tt4, _, _ = clip_targets(gt, born, tid, dv, torch.tensor([[True, False, True, True]]), K, N)
+    assert td4.tolist()[0][0] == 0, 'un hueco muerto no cuenta: la detección pasa a su duplicado vivo'
+
+
+def _batch(tmp, T=6, n=2, frames=60):
+    from tracking.e2e.train import collate
+    from tracking.video.clips import CachedClipDataset
+    _synthetic(tmp, frames)
+    ds = CachedClipDataset(f'{tmp}/train/cache', None, T=T, max_stride=2, p_skip=0.1, max_skip=2, samples_per_epoch=8, seed=0)
+    return collate([ds[i] for i in range(n)])
+
+
+def test_closed_loop_clips_and_curriculum():
+    """Con bucle cerrado, un clip cerrado decide y nace por sí mismo (aparecen nacimientos de más: duplicados y falsos positivos); un clip GT nace una vez por identidad.
+    La proporción de clips cerrados la da ss (la rampa por épocas) y en evaluación todos son cerrados."""
+    from tracking.e2e.train import run_batch
+    with tempfile.TemporaryDirectory() as tmp:
+        batch = _batch(tmp)
+        cfg = _cfg()
+        torch.manual_seed(0)
+        m = H3Model(cfg, IN)                                                        # sin entrenar: sus decisiones propias fallan, así que el bucle cerrado fragmenta
+        _, gt_only = run_batch(m, batch, cfg, 'cpu', True, 0.0)
+        assert gt_only['closed_clips'] == 0 and gt_only['births'] == gt_only['gt_ids'], 'clips GT: un nacimiento por identidad'
+        loss, closed = run_batch(m, batch, cfg, 'cpu', True, 1.0)
+        assert closed['closed_clips'] == 2 and torch.isfinite(loss) and closed['births'] > closed['gt_ids'], 'clips cerrados con un modelo sin entrenar: nacimientos de más'
+        loss.backward()
+        assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+        _, ev = run_batch(m, batch, cfg, 'cpu', False, 0.0)
+        assert ev['closed_clips'] == 2, 'en evaluación todos los clips son cerrados, valga lo que valga ss'
+        legacy = _cfg(closed_loop=False)
+        m2 = H3Model(legacy, IN)
+        _, lg = run_batch(m2, batch, legacy, 'cpu', True, 1.0)
+        assert lg['closed_clips'] == 0 and lg['births'] == lg['gt_ids'], 'closed_loop=false conserva la receta anterior (nacimientos GT)'
+        frac = [run_batch(m, batch, cfg, 'cpu', True, 0.3)[1]['closed_clips'] / 2 for _ in range(60)]
+        assert 0.15 < np.mean(frac) < 0.45, f'con ss=0.3 el 30 % de los clips debe ser cerrado: {np.mean(frac):.2f}'
+
+
 def test_build_model_dispatch():
     assert isinstance(build_model(load_config(None, None), IN), E2EModel)
     assert isinstance(build_model(_cfg(), IN), H3Model)
@@ -417,13 +468,13 @@ def test_losses():
     assert float(perfect) < 1e-5
     a_det = torch.nn.functional.normalize(torch.randn(1, 3, 16), dim=-1)
     a_trk = torch.nn.functional.normalize(torch.randn(1, 4, 16), dim=-1)
-    tid, ids = torch.tensor([[5, 6, -1]]), torch.tensor([[5, 6, 7, -1]])
-    dv, tv = torch.ones(1, 3, dtype=torch.bool), torch.tensor([[True, True, True, False]])
-    li, ni = app_infonce(a_det, a_trk, tid, ids, dv, tv, 0.1)
+    pos_idx, pos_mask = torch.tensor([[0, 1, 4]]), torch.tensor([[True, True, False]])        # las dos primeras detecciones tienen su positivo en los huecos 0 y 1
+    tv = torch.tensor([[True, True, True, False]])
+    li, ni = app_infonce(a_det, a_trk, pos_idx, pos_mask, tv, 0.1)
     assert int(ni) == 2 and torch.isfinite(li)
     aligned = a_trk.clone(); aligned[0, 0], aligned[0, 1] = a_det[0, 0], a_det[0, 1]
-    assert float(app_infonce(a_det, aligned, tid, ids, dv, tv, 0.1)[0]) < float(li), 'alinear positivos baja el InfoNCE'
-    l1, n1 = app_infonce(a_det, a_trk, torch.tensor([[-1, -1, -1]]), ids, dv, tv, 0.1)
+    assert float(app_infonce(a_det, aligned, pos_idx, pos_mask, tv, 0.1)[0]) < float(li), 'alinear positivos baja el InfoNCE'
+    l1, n1 = app_infonce(a_det, a_trk, pos_idx, torch.zeros(1, 3, dtype=torch.bool), tv, 0.1)
     assert int(n1) == 0 and float(l1) == 0.0
 
 

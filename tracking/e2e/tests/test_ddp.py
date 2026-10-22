@@ -90,6 +90,8 @@ def test_ddp_two_processes_cpu(extra_ov=()):
         for x in recs:   # el e2e se registra también por partes (sin ponderar); la de movimiento solo existe en H2/H3
             assert all(np.isfinite(x[f'train_{k}']) and x[f'train_{k}'] >= 0 for k in names[:2]), x
             assert (f'train_{names[2]}' in x) == (motion or h3) and (f'val_{vnames[1]}' in x) == (motion or h3) and np.isfinite(x[f'val_{vnames[0]}']), x
+        if h3:
+            assert all('val_ids_ratio' in x and 'ss' in x for x in recs) and recs[-1]['ss'] == 1.0, 'el registro incluye la fragmentación de la validación y la proporción de clips cerrados'
         assert f'{names[0]} ' in r.stdout and f'{names[1]} ' in r.stdout and ((f'{names[2]} ' in r.stdout) == (motion or h3)), 'las líneas de paso deben mostrar las partes'
         assert os.path.isfile(tmp + '/run/e2e_last.pth') and os.path.isfile(tmp + '/run/detector_last.pth')
 
@@ -102,7 +104,7 @@ def test_ddp_two_processes_cpu_motion():
 def test_ddp_two_processes_cpu_h3():
     """Igual con el H3 (asociación relacional): sus parámetros (atención, gates, Sinkhorn) también deben mantenerse idénticos entre réplicas."""
     test_ddp_two_processes_cpu(('h3.enabled=true', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=4', 'h3.det_thr=0.0',
-                                'state.max_tracks=8', 'tokens.top_k=20'))
+                                'state.max_tracks=8', 'tokens.top_k=20', 'train.ss_max=1.0', 'train.ss_warmup=1'))      # la 2.ª época corre con todos los clips en bucle cerrado
 
 
 if __name__ == '__main__':
