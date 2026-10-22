@@ -1,5 +1,5 @@
 """Bucle de entrenamiento del H3: un lote de clips de T frames procesados secuencialmente con memoria (BPTT sobre el clip) con el ruido de noise.py y las pérdidas de losses.py:
-  L = L_assign + h3.loss.w_motion · L_motion + h3.loss.w_app · L_app.
+  L = L_assign + h3.loss.w_motion · L_motion + h3.loss.w_app · L_app + h3.birth.w · L_birth (BCE de la cabeza de nacimiento, birth_head.py: positivo = detección de una identidad GT sin track vivo).
 Se invoca desde tracking.e2e.train.run_batch cuando h3.enabled=true, así que sirven tal cual el entrenamiento con caché (fase 1: detector congelado), el descongelado con DDP
 (fase 2, train_joint.py) y la evaluación en vivo. Devuelve (pérdida, estadísticas) con las MISMAS claves que el H1/H2 para que los bucles de validación valgan: assoc_sum = L_assign · n
 (así assoc_sum/n es la L_assign media), birth_sum/n_birth = L_app, motion_sum/n_motion = L_motion (los logs las renombran con h3.enabled).
@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 from tracking.e2e.h3.assignment import sinkhorn_nll
-from tracking.e2e.h3.losses import app_infonce, motion_loss
+from tracking.e2e.h3.losses import app_infonce, birth_loss, motion_loss
 from tracking.e2e.h3.noise import noisy_dets
 from tracking.e2e.heads import box_iou_b
 from tracking.e2e.tokens import from_cache
@@ -49,8 +49,8 @@ def run_batch_h3(model, batch, cfg, device, train, ss):
     closed_loop = bool(hc.closed_loop)
     closed = (torch.ones(B, dtype=torch.bool) if not train else (torch.rand(B) < ss)) if closed_loop else torch.zeros(B, dtype=torch.bool)   # tipo de cada clip
     next_id, seen_gt = [1] * B, [set() for _ in range(B)]
-    sa, na, sp, np_, sm, nm = 0.0, 0, 0.0, 0, 0.0, 0
-    st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, births=0, closed_clips=int(closed.sum()))
+    sa, na, sp, np_, sm, nm, sb, nb = 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0
+    st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, births=0, births_dup=0, births_fp=0, closed_clips=int(closed.sum()))
     for t in range(T):
         frame, tid_t = frames[:, t], tid[:, t]
         dets = from_cache(emb[:, t], boxes[:, t], scores[:, t])
@@ -67,6 +67,9 @@ def run_batch_h3(model, batch, cfg, device, train, ss):
             gt_box = torch.gather(clean, 1, target_trk.clamp(max=K - 1)[..., None].expand(-1, -1, 4))
             lm, n_m = motion_loss(out['box_pred'], gt_box, pres)
             sm, nm = sm + lm, nm + int(n_m)
+        if out['birth_logit'] is not None:                                           # cabeza de nacimiento: 1 = identidad GT sin track vivo (los falsos positivos y las identidades ya trackeadas, aunque no se asignen, son 0)
+            lb, n_b = birth_loss(out['birth_logit'], (tid_t >= 0) & dv & ~has_trk, dv, hc.birth.pos_weight, hc.birth.neg_weight)
+            sb, nb = sb + lb, nb + int(n_b)
         if model.use_app:
             lp, n_p = app_infonce(out['a_det'], out['a_trk'], target_det, has_trk & dv, tv, hc.loss.tau_app)
             sp, np_ = sp + lp, np_ + int(n_p)
@@ -91,18 +94,23 @@ def run_batch_h3(model, batch, cfg, device, train, ss):
             if closed_loop and bool(closed[b]):                                      # clip cerrado: nacimientos con la regla de inferencia (admite duplicados y falsos positivos)
                 used = torch.zeros(K, dtype=torch.bool, device=device)
                 used[assign[b][matched[b]]] = True
-                cand = ((~used) & dv[b] & (dets.score[b] >= hc.new_thr)).tolist()
+                cand_t = (~used) & dv[b] & (dets.score[b] >= hc.new_thr)
+                if out['birth_logit'] is not None:                                   # nace solo lo que la cabeza de nacimiento aprobó
+                    cand_t = cand_t & (torch.sigmoid(out['birth_logit'][b].detach()) >= hc.birth.thr)
+                cand = cand_t.tolist()
                 taken = dets.box[b][used]
                 for j in torch.argsort(dets.score[b], descending=True).tolist():
                     if not cand[j]:
                         continue
                     if len(taken) and box_iou_b(dets.box[b, j][None, None], taken[None])[0, 0].max() >= cfg.infer.birth_nms:
                         continue
+                    g = int(tid_t[b, j])                                                         # tipo de nacimiento, para medir cuántos sobran
+                    dup_birth = g >= 0 and bool((gt[b][mem.alive[b]] == g).any())
                     before = mem.alive[b].clone()
                     mem, made = mem.spawn(b, torch.tensor([next_id[b]], device=device), model.init_app(dets.emb[b, j][None]), dets.box[b, j][None], frame[b])
                     if made:
                         gt[b, (mem.alive[b] & ~before).nonzero().flatten()] = tid_t[b, j]
-                        next_id[b] += 1; st['births'] += 1
+                        next_id[b] += 1; st['births'] += 1; st['births_dup'] += int(dup_birth); st['births_fp'] += int(g < 0)
                         taken = torch.cat([taken, dets.box[b, j][None]])
                     else:
                         st['overflow'] += 1
@@ -119,7 +127,9 @@ def run_batch_h3(model, batch, cfg, device, train, ss):
         parts['app'] = sp / max(np_, 1); loss = loss + hc.loss.w_app * parts['app']
     if model.use_mot:
         parts['motion'] = sm / max(nm, 1); loss = loss + hc.loss.w_motion * parts['motion']
+    if model.birth is not None:
+        parts['birth'] = sb / max(nb, 1); loss = loss + hc.birth.w * parts['birth']
     f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)
-    st.update(assoc_sum=f(parts['assign']) * st['n'], birth_sum=f(sp), n_birth=np_, motion_sum=f(sm), n_motion=nm, gt_ids=sum(len(x) for x in seen_gt),
+    st.update(assoc_sum=f(parts['assign']) * st['n'], birth_sum=f(sp), n_birth=np_, motion_sum=f(sm), n_motion=nm, bh_sum=f(sb), bh_n=nb, gt_ids=sum(len(x) for x in seen_gt),
               parts={k: f(v) for k, v in parts.items()})
     return loss, st

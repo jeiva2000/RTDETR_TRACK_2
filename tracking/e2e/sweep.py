@@ -28,16 +28,17 @@ def make_grid(thrs, scores, rule):
     return g
 
 
-def make_grid_h3(probs, scores, guards=(0.0,), dedupes=(0.0,), det_thrs=(None,)):
-    """Rejilla del H3 (no hay cabeza de nacimiento): birth_mode='h3', birth_thr = h3.min_prob (umbral de probabilidad de la pareja), min_score = h3.new_thr, y los mecanismos contra
-    duplicados (h3/loop_breakers.py): guard = h3.birth_guard_iou, dedupe = h3.dedupe_iou (0 = apagado; solo con guarda) y det_thr = h3.det_thr (None = el entrenado)."""
-    return [dict(birth_mode='h3', birth_thr=p, min_score=s, guard=g, dedupe=d, det_thr=dt) for p, s, g, d, dt in itertools.product(probs, scores, guards, dedupes, det_thrs)
+def make_grid_h3(probs, scores, guards=(0.0,), dedupes=(0.0,), det_thrs=(None,), birth_thrs=(None,)):
+    """Rejilla del H3 (no hay cabeza de nacimiento del H1): birth_mode='h3', birth_thr = h3.min_prob (umbral de probabilidad de la pareja), min_score = h3.new_thr, y los mecanismos contra
+    duplicados (h3/loop_breakers.py): guard = h3.birth_guard_iou, dedupe = h3.dedupe_iou (0 = apagado; solo con guarda), det_thr = h3.det_thr (None = el entrenado) y
+    bthr = h3.birth.thr, la probabilidad mínima de la cabeza de nacimiento aprendida (None = la configurada)."""
+    return [dict(birth_mode='h3', birth_thr=p, min_score=s, guard=g, dedupe=d, det_thr=dt, bthr=bt) for p, s, g, d, dt, bt in itertools.product(probs, scores, guards, dedupes, det_thrs, birth_thrs)
             if g or not d]   # dedupe sin guarda NO se prueba: el duplicado eliminado vuelve a nacer en el frame siguiente (medido en sintético: IDs x4 -> x11)
 
 
 def cfg_id(c):
     return (f"{c['birth_mode']}_thr{c['birth_thr']}_s{c['min_score']}" + (f"_g{c['guard']}" if c.get('guard') else '') + (f"_d{c['dedupe']}" if c.get('dedupe') else '') +
-            (f"_dt{c['det_thr']}" if c.get('det_thr') is not None else ''))
+            (f"_dt{c['det_thr']}" if c.get('det_thr') is not None else '') + (f"_b{c['bthr']}" if c.get('bthr') is not None else ''))
 
 
 def load_model(ckpt, device):
@@ -53,6 +54,8 @@ def run_inference(model, cfg, caches, out_dir, c, device):
         ov = [f"h3.min_prob={c['birth_thr']}", f"h3.new_thr={c['min_score']}", f"h3.birth_guard_iou={c.get('guard') or 'null'}", f"h3.dedupe_iou={c.get('dedupe') or 'null'}"]
         trained = cfg.__dict__.setdefault('_det_thr_trained', cfg.h3.det_thr)                  # el barrido muta cfg: se recuerda el det_thr entrenado para no arrastrar el de otra configuración
         ov.append(f"h3.det_thr={trained if c.get('det_thr') is None else c['det_thr']}")
+        b_trained = cfg.__dict__.setdefault('_birth_thr_trained', cfg.h3.birth.thr)
+        ov.append(f"h3.birth.thr={b_trained if c.get('bthr') is None else c['bthr']}")
         deep_update(cfg, parse_overrides(ov))
     else:
         deep_update(cfg, parse_overrides([f"infer.birth_mode={c['birth_mode']}", f"infer.birth_thr={c['birth_thr']}", f"infer.min_score={c['min_score']}"]))
@@ -69,7 +72,8 @@ def sweep(a):
     use = a.runs[:a.sweep_seeds] if a.sweep_seeds else a.runs
     models = {r: load_model(os.path.join(r, a.ckpt_name), a.device) for r in a.runs}
     h3 = models[a.runs[0]][1].h3.enabled
-    grid = make_grid_h3(a.min_prob, a.score, a.guard_iou, a.dedupe_iou, a.det_thr or [None]) if h3 else make_grid(a.thr, a.score, not a.no_rule)
+    bthrs = (a.birth_thr or [None]) if h3 and models[a.runs[0]][1].h3.birth.enabled else [None]       # sin cabeza de nacimiento no hay umbral que barrer
+    grid = make_grid_h3(a.min_prob, a.score, a.guard_iou, a.dedupe_iou, a.det_thr or [None], bthrs) if h3 else make_grid(a.thr, a.score, not a.no_rule)
     os.makedirs(a.out, exist_ok=True)
     results = []
     for c in grid:
@@ -122,6 +126,7 @@ if __name__ == '__main__':
     r.add_argument('--guard-iou', type=float, nargs='+', default=[0.0], help='solo H3: h3.birth_guard_iou (no nace una detección cubierta por un track vivo con IoU >= valor); 0 = apagado')
     r.add_argument('--dedupe-iou', type=float, nargs='+', default=[0.0], help='solo H3: h3.dedupe_iou (se elimina el track más joven de dos solapados con IoU >= valor); 0 = apagado')
     r.add_argument('--det-thr', type=float, nargs='+', default=None, help='solo H3: h3.det_thr de la inferencia (por defecto el del entrenamiento)')
+    r.add_argument('--birth-thr', type=float, nargs='+', default=[0.1, 0.3, 0.5], help='solo H3 con cabeza de nacimiento: h3.birth.thr, probabilidad mínima de crear un track (como birth_thr del H1)')
     r.add_argument('--no-rule', action='store_true', help='no probar el nacimiento por regla (solo cabeza)')
     r.add_argument('--sweep-seeds', type=int, default=0, help='usar solo las primeras N semillas para elegir (0 = todas)')
     r.add_argument('--margin', type=int, default=10); r.add_argument('--cross-iou', type=float, default=0.3)

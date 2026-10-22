@@ -92,6 +92,7 @@ def test_ddp_two_processes_cpu(extra_ov=()):
             assert (f'train_{names[2]}' in x) == (motion or h3) and (f'val_{vnames[1]}' in x) == (motion or h3) and np.isfinite(x[f'val_{vnames[0]}']), x
         if h3:
             assert all('val_ids_ratio' in x and 'ss' in x for x in recs) and recs[-1]['ss'] == 1.0, 'el registro incluye la fragmentación de la validación y la proporción de clips cerrados'
+            assert all(k in x for x in recs for k in ('val_births_dup', 'val_births_fp', 'val_birth_loss', 'train_birth')), 'el registro incluye la cabeza de nacimiento y los nacimientos de más'
         assert f'{names[0]} ' in r.stdout and f'{names[1]} ' in r.stdout and ((f'{names[2]} ' in r.stdout) == (motion or h3)), 'las líneas de paso deben mostrar las partes'
         assert os.path.isfile(tmp + '/run/e2e_last.pth') and os.path.isfile(tmp + '/run/detector_last.pth')
 

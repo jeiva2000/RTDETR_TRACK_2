@@ -388,13 +388,20 @@ def test_sweep_grid_h3_knobs():
     g = W.make_grid_h3([0.5], [0.6], [0.0, 0.5], [0.0, 0.85], [None, 0.5])
     assert len(g) == 6 and len({W.cfg_id(c) for c in g}) == 6, 'cada configuración tiene un identificador distinto'
     assert not any(c['dedupe'] and not c['guard'] for c in g), 'la eliminación de duplicados nunca se prueba sin la guarda de nacimientos'
-    assert W.cfg_id(g[0]) == 'h3_thr0.5_s0.6' and W.make_grid_h3([0.5], [0.6]) == [dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None)]
+    assert W.cfg_id(g[0]) == 'h3_thr0.5_s0.6' and W.make_grid_h3([0.5], [0.6]) == [dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None, bthr=None)]
+    gb = W.make_grid_h3([0.5], [0.5, 0.6], birth_thrs=[0.1, 0.3, 0.5])
+    assert len(gb) == 6 and len({W.cfg_id(c) for c in gb}) == 6 and W.cfg_id(gb[0]).endswith('_b0.1'), 'el umbral de la cabeza de nacimiento entra en la rejilla'
     m = _model()
     trained = m.hc.det_thr
     W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.5, dedupe=0.85, det_thr=0.5), 'cpu')
     assert (m.hc.birth_guard_iou, m.hc.dedupe_iou, m.hc.det_thr) == (0.5, 0.85, 0.5)
     W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None), 'cpu')
     assert (m.hc.birth_guard_iou, m.hc.dedupe_iou, m.hc.det_thr) == (None, None, trained), 'una configuración no arrastra los valores de la anterior'
+    b_trained = m.hc.birth.thr
+    W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None, bthr=0.05), 'cpu')
+    assert m.hc.birth.thr == 0.05
+    W.run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.5, min_score=0.6, guard=0.0, dedupe=0.0, det_thr=None, bthr=None), 'cpu')
+    assert m.hc.birth.thr == b_trained, 'bthr=None vuelve al umbral configurado'
 
 
 def test_clip_targets_with_duplicates_and_false_positive_slots():
@@ -429,7 +436,7 @@ def test_closed_loop_clips_and_curriculum():
     from tracking.e2e.train import run_batch
     with tempfile.TemporaryDirectory() as tmp:
         batch = _batch(tmp)
-        cfg = _cfg()
+        cfg = _cfg(birth=dict(enabled=False))                                      # regla por score: con la cabeza sin entrenar los nacimientos serían arbitrarios
         torch.manual_seed(0)
         m = H3Model(cfg, IN)                                                        # sin entrenar: sus decisiones propias fallan, así que el bucle cerrado fragmenta
         _, gt_only = run_batch(m, batch, cfg, 'cpu', True, 0.0)
@@ -444,8 +451,86 @@ def test_closed_loop_clips_and_curriculum():
         m2 = H3Model(legacy, IN)
         _, lg = run_batch(m2, batch, legacy, 'cpu', True, 1.0)
         assert lg['closed_clips'] == 0 and lg['births'] == lg['gt_ids'], 'closed_loop=false conserva la receta anterior (nacimientos GT)'
+        assert 'births_dup' in closed and closed['births_dup'] + closed['births_fp'] > 0, 'los nacimientos de más se clasifican (duplicado de una identidad con track / falso positivo)'
         frac = [run_batch(m, batch, cfg, 'cpu', True, 0.3)[1]['closed_clips'] / 2 for _ in range(60)]
         assert 0.15 < np.mean(frac) < 0.45, f'con ss=0.3 el 30 % de los clips debe ser cerrado: {np.mean(frac):.2f}'
+
+
+def test_birth_head_and_loss():
+    from tracking.e2e.h3.birth_head import H3BirthHead
+    from tracking.e2e.h3.losses import birth_loss
+    h = H3BirthHead(32, 16)
+    z = lambda *s: torch.zeros(*s)
+    assert h(z(2, 5, 32), z(2, 5), z(2, 5), z(2, 5), z(2, 5), z(2, 5), z(2, 5)).shape == (2, 5)
+    assert h(z(2, 0, 32), z(2, 0), z(2, 0), z(2, 0), z(2, 0), z(2, 0), z(2, 0)).shape == (2, 0), 'D = 0'
+    logit, mask = torch.tensor([[4.0, 4.0, -4.0]]), torch.ones(1, 3, dtype=torch.bool)
+    label = torch.tensor([[True, False, False]])
+    base, n = birth_loss(logit, label, mask)
+    heavy, _ = birth_loss(logit, label, mask, neg_weight=5.0)
+    assert int(n) == 3 and float(heavy) > float(base) + 10, 'neg_weight > 1 penaliza más el falso nacimiento (logit alto con etiqueta 0)'
+    assert float(birth_loss(logit, label, mask, pos_weight=0.0)[0]) < float(base)
+    l0, n0 = birth_loss(logit.clone().requires_grad_(True), label, torch.zeros(1, 3, dtype=torch.bool))
+    assert int(n0) == 0 and float(l0) == 0.0 and l0.requires_grad, 'cero conectado al grafo'
+    m, B, K = _model(), 2, 6
+    for alive, nv in (([3, 5], [4, 6]), ([0, 0], [4, 6]), ([3, 2], [0, 0])):
+        out = m.forward_scores(_mem(m, B, alive), _dets(B, K, nv), torch.tensor([5, 5]))
+        assert out['birth_logit'].shape == (B, K) and torch.isfinite(out['birth_logit']).all()
+    m0 = _model(max_tracks=0)
+    assert m0.forward_scores(m0.new_memory(B, 'cpu'), _dets(B, K), torch.tensor([5, 5]))['birth_logit'].shape == (B, K), 'T = 0'
+    assert _model(birth=dict(enabled=False)).forward_scores(_mem(m, B, [3, 5]), _dets(B, K), torch.tensor([5, 5]))['birth_logit'] is None, 'sin cabeza: None'
+    out = m.forward_scores(_mem(m, B, [3, 5]), _dets(B, K), torch.tensor([5, 5]))      # con detach (por defecto) la pérdida de nacimiento no llega a la asociación
+    birth_loss(out['birth_logit'], torch.zeros(B, K, dtype=torch.bool), torch.ones(B, K, dtype=torch.bool))[0].backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in m.birth.parameters())
+    assert all(p.grad is None for n, p in m.named_parameters() if not n.startswith('birth.')), 'la cabeza de nacimiento no modifica las señales de la asociación'
+
+
+def test_closed_births_follow_the_birth_head():
+    """En los clips cerrados nace solo lo que la cabeza aprueba: con la cabeza apagada (logit muy negativo) no nace ningún track; con la cabeza siempre a favor nacen los de la regla por score
+    (incluidos duplicados y falsos positivos), que se cuentan aparte."""
+    from tracking.e2e.train import run_batch
+    with tempfile.TemporaryDirectory() as tmp:
+        batch = _batch(tmp)
+        cfg = _cfg()
+        torch.manual_seed(0)
+        m = H3Model(cfg, IN)
+        with torch.no_grad():
+            m.birth.net[-1].weight.zero_(); m.birth.net[-1].bias.fill_(-30.0)
+        loss, st = run_batch(m, batch, cfg, 'cpu', True, 1.0)
+        assert st['closed_clips'] == 2 and st['births'] == 0 and torch.isfinite(loss), 'la cabeza dice que no: ningún nacimiento (el bucle cerrado no se rompe sin tracks)'
+        with torch.no_grad():
+            m.birth.net[-1].bias.fill_(30.0)
+        loss, st = run_batch(m, batch, cfg, 'cpu', True, 1.0)
+        assert st['births'] > 0 and st['births_dup'] + st['births_fp'] > 0 and 'birth' in st['parts']
+        loss.backward()
+        assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+
+
+def test_birth_head_learns_on_synthetic():
+    """Con el currículo (de clips GT a clips cerrados) la cabeza aprende a hacer nacer solo las identidades nuevas: en evaluación en bucle cerrado nacen tantos tracks como identidades GT,
+    sin duplicados ni falsos positivos, y su pérdida baja."""
+    from tracking.e2e.train import collate, run_batch
+    from tracking.video.clips import CachedClipDataset
+    with tempfile.TemporaryDirectory() as tmp:
+        _synthetic(tmp, 80)
+        ds = CachedClipDataset(f'{tmp}/train/cache', None, T=6, max_stride=2, p_skip=0.1, max_skip=2, samples_per_epoch=16, seed=0)
+        cfg = _cfg(dim=64)
+        torch.manual_seed(0)
+        m = H3Model(cfg, IN).train()
+        opt = torch.optim.AdamW(m.parameters(), lr=2e-3)
+        first = last = None
+        for step in range(150):
+            batch = collate([ds[(2 * step) % 16], ds[(2 * step + 1) % 16]])
+            loss, st = run_batch(m, batch, cfg, 'cpu', True, min(1.0, step / 75) * 0.9)
+            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+            first = st['parts']['birth'] if step == 0 else first
+            last = st['parts']['birth']
+        assert last < 0.2 * first, f'la pérdida de nacimiento debe bajar: {first:.3f} -> {last:.3f}'
+        m.eval()
+        tot = dict(births=0, dup=0, fp=0, gt=0)
+        for i in range(8):
+            _, ev = run_batch(m, collate([ds[i], ds[i + 8]]), cfg, 'cpu', False, 1.0)
+            tot['births'] += ev['births']; tot['dup'] += ev['births_dup']; tot['fp'] += ev['births_fp']; tot['gt'] += ev['gt_ids']
+        assert tot['births'] <= 1.2 * tot['gt'] and tot['dup'] + tot['fp'] <= 0.1 * tot['births'] and tot['births'] >= 0.8 * tot['gt'], f'nacen las identidades nuevas y poco más: {tot}'
 
 
 def test_build_model_dispatch():
@@ -512,7 +597,7 @@ def test_smoke_train_and_infer():
     with tempfile.TemporaryDirectory() as tmp:
         _synthetic(tmp)
         a = argparse.Namespace(cfg=None, seed=0, device='cpu', gt_root=None, out=f'{tmp}/run', train_cache=f'{tmp}/train/cache', val_cache=f'{tmp}/val/cache',
-                               update=['h3.enabled=true', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=6', 'state.max_tracks=8',
+                               update=['h3.enabled=true', 'h3.birth.enabled=false', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=6', 'state.max_tracks=8',
                                        'train.epochs=2', 'train.samples_per_epoch=8', 'train.batch=2', 'train.T=6', 'train.val_samples=2'])
         main(a)
         for l in open(f'{tmp}/run/log.txt'):
@@ -546,7 +631,7 @@ def test_ablated_models_train():
             assert torch.isfinite(loss), h3
             loss.backward()
             assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None), h3
-            assert set(st['parts']) == {'assign'} | ({'app'} if m.use_app else set()) | ({'motion'} if m.use_mot else set())
+            assert set(st['parts']) == {'assign', 'birth'} | ({'app'} if m.use_app else set()) | ({'motion'} if m.use_mot else set())
 
 
 def test_learns_on_synthetic():

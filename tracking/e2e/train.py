@@ -100,7 +100,7 @@ def has_motion(cfg):
 
 def evaluate(model, ds, cfg, device):
     model.eval()
-    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0)
+    tot = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0, bh_sum=0.0, bh_n=0, births_dup=0, births_fp=0)
     bs = cfg.train.batch
     with torch.no_grad():
         for i in range(0, len(ds), bs):
@@ -115,6 +115,9 @@ def evaluate(model, ds, cfg, device):
         out[nm_name] = tot['motion_sum'] / tot['n_motion']
     if tot['gt_ids']:
         out['ids_ratio'] = tot['births'] / tot['gt_ids']     # IDs creados / identidades GT (solo H3)
+        out['births_dup'], out['births_fp'] = tot['births_dup'], tot['births_fp']                       # nacimientos de más (identidad ya trackeada / falso positivo)
+    if tot['bh_n']:
+        out['birth_head_loss'] = tot['bh_sum'] / tot['bh_n']
     if tot['cross']:
         out['acc_cross'] = tot['ok_cross'] / tot['cross']
     if tot['overflow']:

@@ -1,6 +1,7 @@
 """Pérdidas del H3 (sumas y recuentos; la normalización se hace sobre todo el clip en el bucle de entrenamiento).
 - L_assign (assignment.sinkhorn_nll): NLL sobre la matriz de Sinkhorn contra la asignación GT, dustbin incluido.
 - L_motion: L1 + (1 - GIoU) entre la caja predicha y la caja GT del track en t.
+- L_birth: BCE de la cabeza de nacimiento (birth_head.py), con pesos para penalizar más los falsos nacimientos.
 - L_app: InfoNCE sobre a_det y a_trk; positivo = el hueco que debe recibir la detección según el objetivo de la asignación (misma identidad GT), contra todos los tracks."""
 import torch
 import torch.nn.functional as F
@@ -28,3 +29,13 @@ def app_infonce(a_det, a_trk, pos_idx, pos_mask, trk_valid, tau):
     logits = (a_det @ a_trk.transpose(1, 2) / tau).masked_fill(~trk_valid[:, None, :], NEG)
     nll = torch.logsumexp(logits, -1) - logits.gather(2, pos_idx.clamp(max=a_trk.shape[1] - 1)[..., None]).squeeze(-1)
     return (nll * pos_mask).sum(), n
+
+
+def birth_loss(logit, label, mask, pos_weight=1.0, neg_weight=1.0):
+    """BCE de la cabeza de nacimiento. logit (B,D), label (B,D) bool (1 = identidad GT sin track vivo), mask (B,D) detecciones válidas. pos_weight pesa los positivos y neg_weight los negativos
+    (los falsos nacimientos son negativos con probabilidad alta: neg_weight > 1 los penaliza más) -> (suma, nº de detecciones). Sin detecciones: cero conectado al grafo (DDP)."""
+    n = mask.sum()
+    if n == 0:
+        return logit.sum() * 0.0, n
+    w = torch.where(label, torch.full_like(logit, float(pos_weight)), torch.full_like(logit, float(neg_weight)))
+    return (F.binary_cross_entropy_with_logits(logit, label.float(), reduction='none') * w * mask).sum(), n

@@ -12,7 +12,7 @@ from tracking.e2e.h3 import diagnose as D
 from tracking.e2e.model import build_model
 from tracking.e2e.tests.test_h3 import _synthetic
 
-H3_UPDATE = ['h3.enabled=true', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=6', 'state.max_tracks=8',
+H3_UPDATE = ['h3.enabled=true', 'h3.birth.enabled=false', 'h3.dim=64', 'h3.heads=4', 'h3.ffn=128', 'h3.gru_dim=32', 'h3.app_dim=32', 'h3.K_hist=6', 'state.max_tracks=8',
              'train.epochs=2', 'train.samples_per_epoch=8', 'train.batch=2', 'train.T=6', 'train.val_samples=2']
 
 
@@ -103,6 +103,28 @@ def test_loop_breakers_cut_the_duplicate_loop_in_inference_and_diagnosis():
         deep_update(cfg, {'h3': {'birth_guard_iou': None, 'dedupe_iou': None}})
         again = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
         assert again['ids'] == base['ids'] and again['counts'] == base['counts'], 'apagados, el comportamiento vuelve a ser exactamente el anterior'
+
+
+def test_birth_head_gates_births_in_inference_and_diagnosis():
+    """La cabeza de nacimiento decide quién nace tanto en la inferencia real como en el diagnóstico: con logit muy negativo no nace ningún track; con logit muy positivo, la regla por score."""
+    from tracking.e2e.h3 import infer as I
+    from tracking.e2e.h3.model import H3Model
+    from tracking.e2e.tests.test_h3 import _cfg
+    with tempfile.TemporaryDirectory() as tmp:
+        _synthetic(tmp)
+        seq = torch.load(f'{tmp}/val/cache/va00.pt')
+        cfg = _cfg()
+        torch.manual_seed(0)
+        m = H3Model(cfg, 256).eval()
+        res = {}
+        for name, bias in (('no', -30.0), ('si', 30.0)):
+            with torch.no_grad():
+                m.birth.net[-1].weight.zero_(); m.birth.net[-1].bias.fill_(bias)
+            rows, _ = I.track_sequence(m, seq, cfg, 'cpu')
+            res[name] = (len(rows), D.diagnose(m, cfg, _caches(tmp), 'cpu', ['closed'])['closed'])
+        assert res['no'][0] == 0 and res['no'][1]['ids']['predicted'] == 0, 'sin aprobación de la cabeza no nace nada'
+        assert res['si'][0] > 0 and res['si'][1]['ids']['predicted'] > 0
+        _check_invariants(res['si'][1])
 
 
 def test_summarize_logs():

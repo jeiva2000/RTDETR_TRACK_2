@@ -26,6 +26,7 @@ DEFAULTS = {
         'memory': {'app_update': 'ema', 'alpha': 0.1, 'edges': False, 'edge_dim': 32},   # app_update: ema | gate; edges: memoria de aristas (fase 2)
         'loss': {'w_motion': 1.0, 'w_app': 1.0, 'tau_app': 0.1},     # L = L_assign + w_motion·L_motion + w_app·L_app
         'noise': {'jitter_pos': 0.05, 'jitter_scale': 0.05, 'p_fp': 0.03},   # el drop es train.p_fn
+        'birth': {'enabled': True, 'hidden': 128, 'detach': True, 'w': 1.0, 'pos_weight': 1.0, 'neg_weight': 1.0, 'thr': 0.5},   # cabeza de nacimiento aprendida (birth_head.py); enabled=false: regla por score; thr: probabilidad mínima de nacer (inferencia, se barre)
         'closed_loop': True,                                         # entrenamiento: cada clip, con probabilidad ss (rampa por épocas), corre en bucle cerrado (decisiones y nacimientos del modelo); False = receta anterior
         'new_thr': 0.6,                                              # score mínimo de una detección sin asignar para crear un track (inferencia)
         'min_prob': 0.5,                                             # inferencia: una pareja del Hungarian se acepta si su probabilidad de Sinkhorn P_ij >= min_prob

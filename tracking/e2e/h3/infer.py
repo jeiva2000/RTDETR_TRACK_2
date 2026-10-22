@@ -1,6 +1,6 @@
 """Inferencia frame a frame del H3 sobre la caché de val: mantiene la memoria y exporta MOT (mismo formato y protocolo que tracking/e2e/infer.py).
 Por frame: pasos 1-7 -> Hungarian sobre s con umbral de probabilidad (h3.min_prob) -> actualización de la memoria -> muerte por max_age -> nacimientos:
-detecciones sin asignar con score >= h3.new_thr (y, si se activan, h3.birth_guard_iou y h3.dedupe_iou: tracking/e2e/h3/loop_breakers.py), con supresión de duplicados (IoU >= infer.birth_nms, voraz por score). Un track sin asignar se mantiene en
+detecciones sin asignar con score >= h3.new_thr y probabilidad de la cabeza de nacimiento >= h3.birth.thr (birth_head.py; sin cabeza, solo el score) (y, si se activan, h3.birth_guard_iou y h3.dedupe_iou: tracking/e2e/h3/loop_breakers.py), con supresión de duplicados (IoU >= infer.birth_nms, voraz por score). Un track sin asignar se mantiene en
 memoria hasta max_age (re-entrada) pero no se escribe mientras no se observa."""
 import os, sys
 import torch
@@ -32,6 +32,8 @@ def track_sequence(model, d, cfg, device):
         mem = mem.drop(duplicate_tracks(mem.hist[0, :, -1], mem.alive[0], mem.born[0], mem.ids[0], cfg.h3.dedupe_iou)[None])      # h3.dedupe_iou: elimina el más joven de dos tracks solapados
         guard = birth_guard(box[t], out['box_pred'][0], mem.alive[0], cfg.h3.birth_guard_iou)                                       # h3.birth_guard_iou: no nace lo que un track vivo ya cubre
         cand = (~used) & out['det_valid'][0] & (sc[t] >= cfg.h3.new_thr) & ~guard
+        if out['birth_logit'] is not None:                                                                                            # nace solo lo que la cabeza de nacimiento aprueba (h3.birth.thr)
+            cand &= torch.sigmoid(out['birth_logit'][0]) >= cfg.h3.birth.thr
         taken = box[t][used]
         for j in torch.argsort(sc[t], descending=True).tolist():
             if not cand[j]:

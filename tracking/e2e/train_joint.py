@@ -139,7 +139,7 @@ def main(a):
     @torch.no_grad()
     def eval_live():
         model.eval()
-        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0)
+        tot = dict(n=0, ok=0, present=0, ok_present=0, assoc_sum=0.0, birth_sum=0.0, n_birth=0.0, cross=0, ok_cross=0, overflow=0, motion_sum=0.0, n_motion=0, births=0, gt_ids=0, bh_sum=0.0, bh_n=0, births_dup=0, births_fp=0)
         for i in range(rank, len(val_ds), world):          # cada proceso evalúa sus clips (rank::world) y se suman los recuentos
             c = val_ds[i]
             lg, bx, em = extract_eval(c['images'].to(dev))
@@ -154,7 +154,8 @@ def main(a):
         tot = du.sum_dicts(tot)
         return dict(acc=tot['ok'] / max(tot['n'], 1), acc_present=tot['ok_present'] / max(tot['present'], 1),
                     loss=tot['assoc_sum'] / max(tot['n'], 1), birth_loss=tot['birth_sum'] / max(tot['n_birth'], 1), motion_nll=tot['motion_sum'] / max(tot['n_motion'], 1),
-                    ids_ratio=tot['births'] / tot['gt_ids'] if tot['gt_ids'] else None)    # IDs creados / identidades GT (solo H3; con bucle cerrado mide la fragmentación)
+                    ids_ratio=tot['births'] / tot['gt_ids'] if tot['gt_ids'] else None, births_dup=tot['births_dup'], births_fp=tot['births_fp'],
+                    birth_head_loss=tot['bh_sum'] / tot['bh_n'] if tot['bh_n'] else None)    # IDs creados / identidades GT (solo H3; con bucle cerrado mide la fragmentación)
 
     with torch.no_grad():
         d0 = eval_deta(fwd_eval, a.val_root, val_seqs, a.deta_stride, a.deta_thr, os.path.join(a.out, 'work'), device=dev,
@@ -205,7 +206,8 @@ def main(a):
         ok = bool(du.broadcast_object(cv >= c0 - a.deta_tol))     # la decisión de parar la toma rank 0 y es la misma en todos: si no, unos procesos salen del bucle y otros siguen (DDP se bloquea)
         parts = {f'train_{k}': x / max(run['n'], 1) for k, x in pr.items()}                  # e2e sin ponderar, por partes
         nb_name, nm_name = val_names(cfg)                                                      # H1/H2: birth_loss, motion_nll; H3: app_loss, motion_loss
-        vparts = {f'val_{nb_name}': v['birth_loss'], **({f'val_{nm_name}': v['motion_nll']} if has_motion(cfg) else {}), **({'val_ids_ratio': v['ids_ratio']} if cfg.h3.enabled else {})}
+        vparts = {f'val_{nb_name}': v['birth_loss'], **({f'val_{nm_name}': v['motion_nll']} if has_motion(cfg) else {}), **({'val_ids_ratio': v['ids_ratio'], 'val_births_dup': v['births_dup'], 'val_births_fp': v['births_fp']} if cfg.h3.enabled else {}),
+                  **({'val_birth_loss': v['birth_head_loss']} if cfg.h3.enabled and v['birth_head_loss'] is not None else {})}
         rec = dict(epoch=ep, train_det=run['det'] / max(run['n'], 1), train_e2e=run['e2e'] / max(run['n'], 1), **parts, DetA=d['DetA'], DetA_control=cv,
                    DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), DetA_init_by_thr=d0.get('DetA_by_thr'), n_det=d['n_det'],
                    val_acc=v['acc'], val_acc_present=v['acc_present'], val_loss=v['loss'], **vparts, deta_ok=bool(ok), ss=ss_ep, time=time.time() - t0)

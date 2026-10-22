@@ -137,6 +137,8 @@ def run_sequence(model, cfg, d, device, mode, S):
                     last_tid[g] = trk
             guard = birth_guard(box[t], out['box_pred'][0], mem.alive[0], cfg.h3.birth_guard_iou).cpu().numpy()
             cand0 = (~used) & dv & (sc[t].cpu().numpy() >= cfg.h3.new_thr)
+            if out['birth_logit'] is not None:                              # misma regla que la inferencia: la cabeza de nacimiento debe aprobar
+                cand0 &= (torch.sigmoid(out['birth_logit'][0]) >= cfg.h3.birth.thr).cpu().numpy()
             c['loop_births_guarded'] += int((cand0 & guard).sum())
             cand = cand0 & ~guard
             taken = box[t][torch.from_numpy(used).to(device)]
