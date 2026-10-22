@@ -347,6 +347,24 @@ def test_model_flags_ablations():
         raise AssertionError('con todas las ramas desactivadas debe fallar')
 
 
+def test_threshold_overrides_reach_the_model():
+    """Regresión: el modelo guardaba una COPIA de cfg.h3 al construirse, así que h3.min_prob / h3.new_thr cambiados después (como hace el barrido de sweep.py) no llegaban a
+    la decisión y todas las configuraciones del barrido daban exactamente lo mismo."""
+    from tracking.e2e.sweep import run_inference
+    m = _model()
+    assert m.hc.min_prob == 0.5
+    run_inference(m, m.cfg, {}, tempfile.mkdtemp(), dict(birth_mode='h3', birth_thr=0.1, min_score=0.7), 'cpu')         # lo que hace cada configuración del barrido
+    assert m.hc.min_prob == 0.1 and m.hc.new_thr == 0.7 and m.cfg.h3.min_prob == 0.1
+    B, K = 1, 4
+    s, dv, tv = torch.tensor([[[5.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), torch.ones(B, K, dtype=torch.bool), torch.tensor([[True, True]])
+    lp = A.log_sinkhorn(s, m.assign.z, dv, tv, 50)
+    out = dict(s=s, logP=lp, det_valid=dv, trk_valid=tv)
+    low = m.decide(out)
+    m.cfg['h3']['min_prob'] = 0.999                                          # (cfg.h3 devuelve una copia: se escribe en el dict real, como hace deep_update)
+    high = m.decide(out)
+    assert low[0, 0] == 0 and high[0, 0] == K, 'subir min_prob cambia la decisión sin reconstruir el modelo'
+
+
 def test_build_model_dispatch():
     assert isinstance(build_model(load_config(None, None), IN), E2EModel)
     assert isinstance(build_model(_cfg(), IN), H3Model)

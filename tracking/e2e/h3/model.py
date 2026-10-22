@@ -23,7 +23,7 @@ class H3Model(nn.Module):
     def __init__(self, cfg, in_dim=256):
         super().__init__()
         hc, br = cfg.h3, cfg.h3.branches
-        self.cfg, self.hc, self.in_dim = cfg, hc, in_dim
+        self.cfg, self.in_dim = cfg, in_dim
         self.use_app, self.use_mot, self.use_rel = bool(br.app), bool(br.mot), bool(br.rel)
         dim, ad, H = hc.dim, hc.app_dim, hc.heads
         self.app = AppearanceHead(in_dim, in_dim, ad)
@@ -37,6 +37,12 @@ class H3Model(nn.Module):
         self.assign = Assignment(hc.sinkhorn_iters)
         self.updater = AppUpdater(in_dim, hc.memory.app_update, hc.memory.alpha)
         self.edges = EdgeMemory(hc.memory.edge_dim, H) if (hc.memory.edges and self.use_rel) else None
+
+    @property
+    def hc(self):
+        """Configuración h3 ACTUAL: se lee de cfg en cada uso (cfg.h3 devuelve una copia, así que guardarla en __init__ dejaría los umbrales fijos y los cambios posteriores,
+        como los del barrido de sweep.py (h3.min_prob, h3.new_thr), no llegarían al modelo)."""
+        return self.cfg.h3
 
     def new_memory(self, B, device):
         return TrackMemory.empty(B, self.cfg.state.max_tracks, self.in_dim, self.hc.K_hist, device, self.hc.memory.edge_dim if self.edges is not None else 0)

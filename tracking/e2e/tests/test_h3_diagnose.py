@@ -66,8 +66,7 @@ def test_forced_failure_is_detected_and_attributed():
     with tempfile.TemporaryDirectory() as tmp:
         model, cfg, _ = _trained(tmp)
         good = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
-        deep_update(cfg, {'h3': {'min_prob': 0.9999}})
-        model.hc = cfg.h3
+        deep_update(cfg, {'h3': {'min_prob': 0.9999}})                      # sin tocar el modelo: debe leer la configuración viva
         bad = D.diagnose(model, cfg, _caches(tmp), 'cpu', ['closed'])['closed']
         _check_invariants(bad)
         assert good['decisions_present']['missed'] < 0.05 and bad['decisions_present']['missed'] > 0.9
