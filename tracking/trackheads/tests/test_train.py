@@ -156,10 +156,12 @@ def test_train_smoke_and_resume():
         best = main(_args(root, out), det)
         assert os.path.isfile(os.path.join(out, 'best.pth')) and os.path.isfile(os.path.join(out, 'last.pth'))
         log = [json.loads(l) for l in open(os.path.join(out, 'log.txt'))]
-        assert [r['epoch'] for r in log] == [0, 1] and best == max(r['val_iou'] for r in log)
-        for k in ('val_iou', 'val_iou_prev', 'val_iou_gain', 'val_pres_acc', 'val_attn_mass', 'train_loss', 'train_loss_attn', 'val_loss'):
+        assert [r['epoch'] for r in log] == [0, 1] and best == max(r['val_assoc_pred'] for r in log)
+        for k in ('val_iou', 'val_iou_prev', 'val_iou_gain', 'val_pres_acc', 'val_attn_mass', 'train_loss', 'train_loss_attn', 'val_loss',
+              'val_assoc_pred', 'val_assoc_prev', 'val_assoc_attn', 'val_assoc_gain'):
             assert all(np.isfinite(r[k]) for r in log), k
         assert log[0]['train_n_tracks'] > 0 and 0 < log[0]['val_present_frac'] <= 1
+        assert log[0]['val_assoc_n'] > 0 and log[0]['select'] == 'val_assoc_pred'
         main(_args(root, out, epochs=3, resume=True), det)                            # reanuda: solo la época 2
         log = [json.loads(l) for l in open(os.path.join(out, 'log.txt'))]
         assert [r['epoch'] for r in log] == [0, 1, 2]
@@ -179,6 +181,7 @@ def test_diagnose_smoke():
         assert t['n'] > 0 and 0 <= t['iou_prev'] <= 1 and 0 <= t['iou_pred'] <= 1
         assert t['iou_det_techo'] > 0.9 and t['det_encontrada'] == 1.0            # el detector simulado usa la caja GT con ruido pequeño
         assert sum(r.get('n', 0) for k, r in res.items() if k.startswith('k')) == t['n']
+        assert res['cruces'].get('n', 0) + res['sin_cruce']['n'] == t['n'] and t['n_asoc'] > 0 and 0 <= t['asoc_pred'] <= 1
         assert res['presencia']['n'] >= t['n'] and os.path.isfile(os.path.join(out, 'diagnose.json'))
 
 

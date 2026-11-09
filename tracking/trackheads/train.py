@@ -1,8 +1,9 @@
 """Entrenamiento de TrackHeads (etapa 1) con el RT-DETRv2 congelado, en línea (los mapas del encoder no se cachean: ~8.6 MB por frame).
 Cada paso: un lote de pares (t, t+k) -> UN forward del detector sobre los 2B frames -> tracks del frame t (detecciones emparejadas con el GT)
 y memoria del frame t+k -> TrackHeads -> pérdida (caja + presencia + atención auxiliar). Solo se entrena TrackHeads.
-Validación: pares fijos de val; métricas = IoU de la caja predicha frente a quedarse en prev_box (iou_gain), IoU≥0.5/0.75, acierto de
-presencia y masa de la atención dentro de la caja GT. best.pth = mejor IoU de val; last.pth permite reanudar (--resume).
+Validación: pares fijos de val. Métrica principal (--select assoc, por defecto): acierto de ASOCIACIÓN, si la caja predicha apunta a la
+detección correcta de t+k, frente a hacerlo con prev_box (assoc_gain), en total y en cruces (assoc.py). También: IoU de la caja frente a
+prev_box (iou_gain), acierto de presencia y masa de la atención en la caja GT. best.pth = mejor métrica de val; last.pth permite reanudar.
 Uso: python -m tracking.trackheads.train --det-ckpt $OUTPUT_ROOT/detector_r50vd_person/best.pth --out $OUTPUT_ROOT/trackheads/<run> [...]"""
 import argparse, json, math, os, random, sys, time
 
@@ -10,10 +11,14 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from tracking.trackheads.assoc import assoc_flags, assoc_sums, assoc_summary
 from tracking.trackheads.data import PairDataset, collate
 from tracking.trackheads.losses import batch_stats, summarize, trackheads_loss
 from tracking.trackheads.model import TrackHeads
 from tracking.trackheads.targets import build_tracks
+
+
+SELECT = dict(assoc='val_assoc_pred', iou='val_iou')   # métrica de val que elige best.pth y controla la parada temprana
 
 
 def build_model(a):
@@ -21,13 +26,13 @@ def build_model(a):
 
 
 def run_batch(det, model, batch, a, device):
-    """-> (out, tg). Un forward del detector con los frames t y t+k juntos."""
+    """-> (out, tg, ctx). Un forward del detector con los frames t y t+k juntos; ctx = detecciones de t+k (para la asociación)."""
     B = batch['img_t'].shape[0]
     q, tid, feats = det.detect(torch.cat([batch['img_t'], batch['img_tk']]).to(device), batch['gt_t'] + batch['gt_tk'], a.min_iou)
     q_t = {k: v[:B] for k, v in q.items()}
     tg = build_tracks(q_t, tid[:B], batch['gt_tk'], a.det_thr, a.max_tracks)
     out = model(tg['emb'], tg['prev_box'], [f[B:] for f in feats], tg['track_mask'])
-    return out, tg
+    return out, tg, dict(box_k=q['boxes'][B:], sc_k=q['scores'][B:], tid_k=tid[B:])
 
 
 def loss_kw(a):
@@ -44,13 +49,15 @@ def evaluate(det, model, dl, a, device):
     model.eval()
     acc, parts, n = {}, {}, 0
     for batch in dl:
-        out, tg = run_batch(det, model, batch, a, device)
+        out, tg, ctx = run_batch(det, model, batch, a, device)
         _, p = trackheads_loss(out, tg, **loss_kw(a))
         add(acc, batch_stats(out, tg))
+        add(acc, assoc_sums(assoc_flags(out, tg, **ctx, gt_t=batch['gt_t'], gt_tk=batch['gt_tk'], det_thr=a.det_thr, cross_iou=a.cross_iou)))
         add(parts, p)
         n += 1
     model.train()
     res = summarize(acc)
+    res.update(assoc_summary(acc))
     res.update({f'loss_{k}' if k != 'loss' else 'loss': v / max(n, 1) for k, v in parts.items()})
     return res
 
@@ -88,7 +95,7 @@ def main(a, detector=None):
         ck = torch.load(last, map_location='cpu')
         model.load_state_dict(ck['model']); opt.load_state_dict(ck['opt'])
         start, step, best, bad = ck['epoch'] + 1, ck['step'], ck['best'], ck['bad']
-        print(f'reanudando desde la época {start} (mejor val_iou {best:.4f})', flush=True)
+        print(f'reanudando desde la época {start} (mejor {SELECT[a.select]} {best:.4f})', flush=True)
 
     log = open(os.path.join(a.out, 'log.txt'), 'a')
     for ep in range(start, a.epochs):
@@ -97,7 +104,7 @@ def main(a, detector=None):
         for batch in dl_tr:
             for g in opt.param_groups:
                 g['lr'] = lr_at(step, total, a.warmup, a.lr)
-            out, tg = run_batch(det, model, batch, a, device)
+            out, tg, _ = run_batch(det, model, batch, a, device)
             loss, p = trackheads_loss(out, tg, **loss_kw(a))
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -112,20 +119,24 @@ def main(a, detector=None):
         rec.update({f'train_{k}': v for k, v in summarize(acc).items()})
         rec.update({f'train_{k}' if k == 'loss' else f'train_loss_{k}': v / max(n, 1) for k, v in parts.items()})
         rec.update({f'val_{k}': v for k, v in evaluate(det, model, dl_va, a, device).items()})
-        improved = rec['val_iou'] > best + a.min_delta
+        score = rec[SELECT[a.select]]
+        score = -1.0 if score is None else score
+        improved = score > best + a.min_delta
         if improved:
-            best, bad = rec['val_iou'], 0
+            best, bad = score, 0
             torch.save(dict(model=model.state_dict(), args=vars(a), epoch=ep, val=rec), os.path.join(a.out, 'best.pth'))
         else:
             bad += 1
-        rec.update(best_val_iou=best, improved=improved)
+        rec.update(select=SELECT[a.select], best_val=best, improved=improved)
         log.write(json.dumps(rec) + '\n'); log.flush()
-        print(f"ep {ep} | val iou {rec['val_iou']:.4f} (prev_box {rec['val_iou_prev']:.4f}, ganancia {rec['val_iou_gain']:+.4f}) "
+        fmt = lambda v: 'n/a' if v is None else f'{v:.4f}'
+        print(f"ep {ep} | val asociación {fmt(rec['val_assoc_pred'])} (prev_box {fmt(rec['val_assoc_prev'])}, atención {fmt(rec['val_assoc_attn'])}) "
+              f"cruces {fmt(rec['val_cross_pred'])} (prev_box {fmt(rec['val_cross_prev'])}, n={rec['val_cross_n']}) | val iou {rec['val_iou']:.4f} (prev_box {rec['val_iou_prev']:.4f}, ganancia {rec['val_iou_gain']:+.4f}) "
               f"iou50 {rec['val_iou50']:.3f} pres_acc {rec['val_pres_acc']:.3f} attn_mass {rec['val_attn_mass']:.3f} "
               f"| train loss {rec['train_loss']:.4f} | {rec['time']}s{' *' if improved else ''}", flush=True)
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), args=vars(a), epoch=ep, step=step, best=best, bad=bad), last)
         if a.patience and bad >= a.patience:
-            print(f'parada temprana: {a.patience} épocas sin mejorar val_iou', flush=True)
+            print(f'parada temprana: {a.patience} épocas sin mejorar {SELECT[a.select]}', flush=True)
             break
     log.close()
     return best
@@ -153,6 +164,8 @@ def parser():
     p.add_argument('--min-iou', type=float, default=0.5, help='IoU mínimo detección–GT para que una detección sea un track')
     p.add_argument('--det-thr', type=float, default=0.3, help='score mínimo de una detección para ser track')
     p.add_argument('--max-tracks', type=int, default=64)
+    p.add_argument('--cross-iou', type=float, default=0.3, help='IoU entre cajas GT a partir del cual un track está en un cruce (métrica)')
+    p.add_argument('--select', choices=list(SELECT), default='assoc', help='métrica de val para best.pth y la parada temprana')
     # modelo
     p.add_argument('--d-h', type=int, default=64)
     p.add_argument('--rank', type=int, default=8)

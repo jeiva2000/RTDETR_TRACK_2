@@ -1,5 +1,7 @@
 """Diagnóstico de un checkpoint de TrackHeads sobre los pares fijos de val: ¿dónde se pierde la caja?
-Por tramo de k y en total, sobre tracks presentes en t+k:
+Por tramo de k, en total y en cruces (la caja GT del track solapa con otra identidad en t o t+k), sobre tracks presentes en t+k:
+- ASOCIACIÓN (assoc.py), lo que importa: sobre tracks cuya identidad está detectada en t+k, acierto al elegir la detección de t+k por IoU
+  con la caja predicha (assoc_pred), con prev_box (assoc_prev: la referencia a batir) o por masa de la atención (assoc_attn).
 - IoU con el GT de t+k: prev_box (quedarse quieto), predicción y TECHO = caja del propio detector en t+k para esa identidad (si la detectó).
 - Error de centro en unidades de la caja GT (|Δcx|/w + |Δcy|/h): prev_box, predicción y centro atencional (attn·xy). Si el centro atencional
   no mejora a prev_box, la atención no está localizando el desplazamiento aunque attn_mass sea alto (cajas solapadas).
@@ -13,6 +15,7 @@ import argparse, json, os, sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from tracking.trackheads.assoc import assoc_flags, gt_cross
 from tracking.trackheads.data import PairDataset, collate
 from tracking.trackheads.losses import attn_mass_in_box, box_iou
 from tracking.trackheads.targets import build_tracks
@@ -33,7 +36,7 @@ def size_err(b, g):
 def diagnose(det, model, dl, a, device):
     model.eval()
     rows = {k: [] for k in ('k', 'iou_prev', 'iou_pred', 'iou_det', 'has_det', 'cerr_prev', 'cerr_pred', 'cerr_attn',
-                            'serr_prev', 'serr_pred', 'mass_gt', 'mass_prev', 'peak')}
+                            'serr_prev', 'serr_pred', 'mass_gt', 'mass_prev', 'peak', 'a_valid', 'a_pred', 'a_prev', 'a_attn', 'cross')}
     pres = {k: [] for k in ('present', 'prob')}
     for batch in dl:
         B = batch['img_t'].shape[0]
@@ -55,10 +58,12 @@ def diagnose(det, model, dl, a, device):
         mass_gt, _ = attn_mass_in_box(out['attn'], out['token_xy'], gt)
         mass_prev, _ = attn_mass_in_box(out['attn'], out['token_xy'], prev)
         kk = batch['k'].to(device)[:, None].expand_as(m)
+        f = assoc_flags(out, tg, box_k, sc_k, tid_k, batch['gt_t'], batch['gt_tk'], a.det_thr, a.cross_iou)
         vals = dict(k=kk, iou_prev=box_iou(prev, gt), iou_pred=box_iou(pred, gt), iou_det=box_iou(det_box, gt), has_det=has.float(),
                     cerr_prev=center_err(prev, gt), cerr_pred=center_err(pred, gt), cerr_attn=center_err(torch.cat([c_attn, gt[..., 2:]], -1), gt),
                     serr_prev=size_err(prev, gt), serr_pred=size_err(pred, gt), mass_gt=mass_gt, mass_prev=mass_prev,
-                    peak=out['attn'].amax(-1))
+                    peak=out['attn'].amax(-1), a_valid=f['valid'], a_pred=f['ok_pred'], a_prev=f['ok_prev'], a_attn=f['ok_attn'],
+                    cross=gt_cross(tg['track_id'], batch['gt_t'], batch['gt_tk'], a.cross_iou))   # todos los presentes, no solo los detectados en t+k
         for k, v in vals.items():
             rows[k].append(v[pm].float().cpu())
     R = {k: torch.cat(v) for k, v in rows.items()}
@@ -70,7 +75,10 @@ def diagnose(det, model, dl, a, device):
             return dict(n=0)
         mean = lambda k: round(float(R[k][sel].mean()), 4)
         hd = sel & (R['has_det'] > 0)
-        return dict(n=n, iou_prev=mean('iou_prev'), iou_pred=mean('iou_pred'),
+        av = sel & (R['a_valid'] > 0)
+        na = int(av.sum())
+        acc = lambda k: round(float(R[k][av].mean()), 4) if na else None
+        return dict(n=n, n_asoc=na, asoc_prev=acc('a_prev'), asoc_pred=acc('a_pred'), asoc_atencion=acc('a_attn'), iou_prev=mean('iou_prev'), iou_pred=mean('iou_pred'),
                     iou_det_techo=round(float(R['iou_det'][hd].mean()), 4) if hd.any() else None, det_encontrada=mean('has_det'),
                     centro_prev=mean('cerr_prev'), centro_pred=mean('cerr_pred'), centro_atencion=mean('cerr_attn'),
                     tamano_prev=mean('serr_prev'), tamano_pred=mean('serr_pred'),
@@ -79,6 +87,8 @@ def diagnose(det, model, dl, a, device):
     res = dict(total=summ(torch.ones_like(R['k'], dtype=torch.bool)))
     for lo, hi in BUCKETS:
         res[f'k{lo}-{hi}' if hi < 10 ** 9 else f'k>={lo}'] = summ((R['k'] >= lo) & (R['k'] <= hi))
+    res['cruces'] = summ(R['cross'] > 0)
+    res['sin_cruce'] = summ(R['cross'] == 0)
     ab = P['present'] < 0.5
     res['presencia'] = dict(n=len(P['present']), frac_ausentes=round(float(ab.float().mean()), 4),
                             recall_ausentes=round(float((P['prob'][ab] < 0.5).float().mean()), 4) if ab.any() else None,
@@ -88,7 +98,7 @@ def diagnose(det, model, dl, a, device):
 
 
 def show(res):
-    cols = ['n', 'iou_prev', 'iou_pred', 'iou_det_techo', 'det_encontrada', 'centro_prev', 'centro_pred', 'centro_atencion',
+    cols = ['n', 'n_asoc', 'asoc_prev', 'asoc_pred', 'asoc_atencion', 'iou_prev', 'iou_pred', 'iou_det_techo', 'det_encontrada', 'centro_prev', 'centro_pred', 'centro_atencion',
             'tamano_prev', 'tamano_pred', 'masa_en_gt', 'masa_en_prev', 'pico_atencion']
     print('| tramo | ' + ' | '.join(cols) + ' |')
     print('|---' * (len(cols) + 1) + '|')
@@ -106,6 +116,7 @@ def main(a, detector=None):
         if getattr(a, k):
             setattr(ta, k, getattr(a, k))
     ta.amp = ta.amp and not a.no_amp
+    ta.cross_iou = a.cross_iou                                 # los checkpoints anteriores a la métrica de asociación no lo tienen
     model = build_model(ta).to(device)
     model.load_state_dict(ck['model'])
     if detector is None:
@@ -134,6 +145,7 @@ def parser():
     p.add_argument('--num-workers', type=int, default=6)
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--no-amp', action='store_true')
+    p.add_argument('--cross-iou', type=float, default=0.3, help='IoU entre cajas GT a partir del cual un track está en un cruce')
     p.add_argument('--out', default=None, help='por defecto, diagnose.json junto al checkpoint')
     return p
 

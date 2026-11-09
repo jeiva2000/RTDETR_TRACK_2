@@ -12,9 +12,11 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 | `targets.py` | `build_tracks`: tracks del frame t y objetivos en t+k (presencia y caja GT). |
 | `losses.py` | `trackheads_loss` (L1 + GIoU, BCE de presencia, atención auxiliar) y las métricas (`batch_stats`, `summarize`). |
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
-| `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k: IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
+| `assoc.py` | Acierto de asociación: si la caja predicha (o la atención) apunta a la detección correcta de t+k, frente a hacerlo con prev_box; en total y en cruces. Es la métrica que elige `best.pth`. |
+| `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k y en cruces: acierto de asociación (pred, prev_box, atención); IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
 | `tests/test_model.py` | 12 tests en CPU (~5 s): formas, orden de los tokens, inicialización identidad, prior, independencia entre tracks, equivalencia de rango r, decodificación, gradientes y aprendizaje sintético. |
-| `tests/test_train.py` | 6 tests en CPU (~2 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
+| `tests/test_assoc.py` | 3 tests con casos a mano de la métrica de asociación y de los cruces. |
+| `tests/test_train.py` | 7 tests en CPU (~2 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
 | `slurm/trackheads.sbatch` | Lanzamiento en el clúster (1 GPU). |
 
 ```python
@@ -53,6 +55,15 @@ detector, no los del GT, como en inferencia. **Objetivos**: presente si la ident
 **Pérdida**: `5·L1 + 2·(1−GIoU)` solo en tracks presentes, más `1·BCE(presencia)` y `1·[−log masa de la atención dentro de la caja GT]`.
 **Optimización**: AdamW con lr 1e-4 y wd 1e-4, warmup de 500 pasos y coseno, clip 1.0, 30 épocas de 8000 pares, parada tras 6 épocas sin
 mejorar `val_iou`. k ~ U{1..10} (DanceTrack va a 20 fps, así que hasta 0.5 s).
+
+**Qué se optimiza y qué se mide.** La pérdida es de caja y presencia, pero el objetivo es la **identidad**. La caja del detector en t+k
+siempre será mejor que la predicha, así que la cabeza no tiene que competir con ella: tiene que apuntar a la detección correcta. Por eso
+`best.pth` y la parada temprana usan `val_assoc_pred` (`--select assoc`, por defecto; `--select iou` recupera el criterio anterior). Esta
+métrica es el acierto al elegir, entre las detecciones de t+k con score ≥ `--det-thr`, la de mayor IoU con la caja predicha. Se compara con
+`val_assoc_prev` (lo mismo con prev_box: un tracker por IoU sin movimiento) y con `val_assoc_attn` (la detección con más masa de la
+atención). Las mismas tres métricas en cruces (`val_cross_*`, cajas GT con IoU > `--cross-iou` 0.3 en t o t+k) son el caso donde prev_box
+falla y la cabeza debería aportar. **No reanude con `--resume` una ejecución entrenada con el criterio anterior**: su mejor valor guardado es
+un IoU y no se puede comparar con un acierto de asociación.
 
 **Cómo leer el log**: `val_iou` frente a `val_iou_prev` (quedarse en la caja del frame t) y su diferencia `val_iou_gain`, que es lo que la
 cabeza aporta. También `val_iou50` y `val_iou75` frente a sus `_prev`, `val_pres_acc` y `val_pres_recall_neg` (ausentes detectados),
