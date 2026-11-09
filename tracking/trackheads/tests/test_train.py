@@ -169,6 +169,26 @@ def test_train_smoke_and_resume():
         m = TrackHeads(); m.load_state_dict(ck['model'])
 
 
+def test_resume_guards():
+    """No se reanuda con otro --select (los mejores valores no son comparables); tras una parada temprana, relanzar no reentrena."""
+    with tempfile.TemporaryDirectory() as d:
+        root, out = os.path.join(d, 'data'), os.path.join(d, 'out')
+        make_mot_root(root)
+        det = StubDetector()
+        main(_args(root, out, epochs=1, select='iou'), det)
+        try:
+            main(_args(root, out, epochs=2, resume=True), det)
+            raise AssertionError('debía negarse a reanudar con otro --select')
+        except SystemExit as e:
+            assert '--select' in str(e)
+        out2 = os.path.join(d, 'out2')
+        main(_args(root, out2, epochs=5, patience=1, min_delta=10.0), det)           # min_delta enorme: ninguna época mejora, para tras la 1.ª
+        n = len(open(os.path.join(out2, 'log.txt')).readlines())
+        assert n == 1, n
+        main(_args(root, out2, epochs=5, patience=1, min_delta=10.0, resume=True), det)
+        assert len(open(os.path.join(out2, 'log.txt')).readlines()) == n
+
+
 def test_diagnose_smoke():
     with tempfile.TemporaryDirectory() as d:
         root, out = os.path.join(d, 'data'), os.path.join(d, 'out')

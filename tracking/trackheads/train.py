@@ -93,6 +93,13 @@ def main(a, detector=None):
     last = os.path.join(a.out, 'last.pth')
     if a.resume and os.path.isfile(last):
         ck = torch.load(last, map_location='cpu')
+        old = ck['args'].get('select', 'iou')                  # las ejecuciones anteriores a --select elegían por val_iou
+        if old != a.select:
+            sys.exit(f'{last} se entrenó con --select {old} y ahora es --select {a.select}: su mejor valor no es comparable. '
+                     f'Use otro --out (RUN_NAME) o --select {old}.')
+        if ck.get('stopped'):                                   # parada temprana: relanzar no reentrena (al completar las épocas, el bucle ya no hace nada)
+            print(f'el entrenamiento de {a.out} terminó por parada temprana en la época {ck["epoch"]}; no se entrena más', flush=True)
+            return ck['best']
         model.load_state_dict(ck['model']); opt.load_state_dict(ck['opt'])
         start, step, best, bad = ck['epoch'] + 1, ck['step'], ck['best'], ck['bad']
         print(f'reanudando desde la época {start} (mejor {SELECT[a.select]} {best:.4f})', flush=True)
@@ -134,8 +141,9 @@ def main(a, detector=None):
               f"cruces {fmt(rec['val_cross_pred'])} (prev_box {fmt(rec['val_cross_prev'])}, n={rec['val_cross_n']}) | val iou {rec['val_iou']:.4f} (prev_box {rec['val_iou_prev']:.4f}, ganancia {rec['val_iou_gain']:+.4f}) "
               f"iou50 {rec['val_iou50']:.3f} pres_acc {rec['val_pres_acc']:.3f} attn_mass {rec['val_attn_mass']:.3f} "
               f"| train loss {rec['train_loss']:.4f} | {rec['time']}s{' *' if improved else ''}", flush=True)
-        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), args=vars(a), epoch=ep, step=step, best=best, bad=bad), last)
-        if a.patience and bad >= a.patience:
+        stop = bool(a.patience and bad >= a.patience)
+        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), args=vars(a), epoch=ep, step=step, best=best, bad=bad, stopped=stop), last)
+        if stop:
             print(f'parada temprana: {a.patience} épocas sin mejorar {SELECT[a.select]}', flush=True)
             break
     log.close()

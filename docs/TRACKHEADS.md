@@ -43,10 +43,10 @@ out = m(emb, prev_box, feats, track_mask)
 ## Entrenamiento
 ```bash
 python -m tracking.trackheads.tests.test_model && python -m tracking.trackheads.tests.test_train    # tests (CPU, segundos)
-sbatch slurm/trackheads.sbatch                                     # detector: $OUTPUT_ROOT/detector_r50vd_person/best.pth (o DET_CKPT=...)
+sbatch slurm/trackheads.sbatch      # entrena y al terminar diagnostica best.pth; detector: $OUTPUT_ROOT/detector_r50vd_person/best.pth (o DET_CKPT=...)
 RUN_NAME=th_noattn EXTRA="--w-attn 0" sbatch slurm/trackheads.sbatch   # ablación: sin la pérdida auxiliar de atención
 ```
-Salida en `$OUTPUT_ROOT/trackheads/<RUN_NAME>/`: `best.pth` (mejor `val_iou`), `last.pth` (reanudación), `log.txt` (una línea JSON por época), `args.json`.
+Salida en `$OUTPUT_ROOT/trackheads/<RUN_NAME>/` (por defecto `trackheads_v2`): `best.pth` (mejor métrica de `--select`), `last.pth` (reanudación), `log.txt` (una línea JSON por época), `args.json` y `diagnose.json` (el diagnóstico final, también impreso en el log del trabajo). Relanzar con el mismo `RUN_NAME` reanuda si se cortó por tiempo; si terminó, solo repite el diagnóstico. No reanuda una ejecución entrenada con otro `--select`.
 
 **Receta.** Cada paso toma B pares (t, t+k) y hace **un** forward del detector congelado con los 2B frames. Los mapas del encoder no se
 cachean (unos 8.6 MB por frame en fp32). Los **tracks** son las detecciones del frame t emparejadas con una identidad GT por el Hungarian
