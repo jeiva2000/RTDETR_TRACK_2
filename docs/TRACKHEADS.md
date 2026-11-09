@@ -12,6 +12,7 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 | `targets.py` | `build_tracks`: tracks del frame t y objetivos en t+k (presencia y caja GT). |
 | `losses.py` | `trackheads_loss` (L1 + GIoU, BCE de presencia, atención auxiliar) y las métricas (`batch_stats`, `summarize`). |
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
+| `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k: IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
 | `tests/test_model.py` | 12 tests en CPU (~5 s): formas, orden de los tokens, inicialización identidad, prior, independencia entre tracks, equivalencia de rango r, decodificación, gradientes y aprendizaje sintético. |
 | `tests/test_train.py` | 6 tests en CPU (~2 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
 | `slurm/trackheads.sbatch` | Lanzamiento en el clúster (1 GPU). |

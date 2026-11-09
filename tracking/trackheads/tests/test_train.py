@@ -16,6 +16,7 @@ from tracking.trackheads.losses import attn_mass_in_box, batch_stats, summarize,
 from tracking.trackheads.model import TrackHeads
 from tracking.trackheads.targets import build_tracks
 from tracking.trackheads.train import main, parser
+from tracking.trackheads import diagnose as diag
 
 D = 256
 
@@ -164,6 +165,21 @@ def test_train_smoke_and_resume():
         assert [r['epoch'] for r in log] == [0, 1, 2]
         ck = torch.load(os.path.join(out, 'best.pth'), map_location='cpu')
         m = TrackHeads(); m.load_state_dict(ck['model'])
+
+
+def test_diagnose_smoke():
+    with tempfile.TemporaryDirectory() as d:
+        root, out = os.path.join(d, 'data'), os.path.join(d, 'out')
+        make_mot_root(root)
+        det = StubDetector()
+        main(_args(root, out, epochs=1), det)
+        a = diag.parser().parse_args(['--ckpt', os.path.join(out, 'best.pth'), '--device', 'cpu', '--num-workers', '0', '--k-max', '8'])
+        res = diag.main(a, det)
+        t = res['total']
+        assert t['n'] > 0 and 0 <= t['iou_prev'] <= 1 and 0 <= t['iou_pred'] <= 1
+        assert t['iou_det_techo'] > 0.9 and t['det_encontrada'] == 1.0            # el detector simulado usa la caja GT con ruido pequeño
+        assert sum(r.get('n', 0) for k, r in res.items() if k.startswith('k')) == t['n']
+        assert res['presencia']['n'] >= t['n'] and os.path.isfile(os.path.join(out, 'diagnose.json'))
 
 
 if __name__ == '__main__':
