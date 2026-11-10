@@ -14,6 +14,9 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
 | `assoc.py` | Acierto de asociación: si el Associator (o su término de apariencia, la caja predicha o la atención) elige la detección correcta de t+k, frente a hacerlo por IoU con prev_box; en total y en cruces; y la clase "ninguna". `val_assoc_head` elige `best.pth`. |
 | `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k y en cruces: acierto de asociación (pred, prev_box, atención); IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
+| `track.py` | Tracker en línea sobre secuencias completas de val: modos `head` (Associator + Hungarian) e `iou` (referencia con la misma maquinaria), para evaluar con TrackEval. |
+| `slurm/trackheads_track.sbatch` | Tracking de val + TrackEval (global y cruces) + tabla con ByteTrack/OC-SORT del baseline si existen. |
+| `tests/test_track.py` | 2 tests: Hungarian con "ninguna" y humo del tracker y de TrackEval sobre el DanceTrack sintético. |
 | `tests/test_model.py` | 12 tests en CPU (~5 s): formas, orden de los tokens, inicialización identidad, prior, independencia entre tracks, equivalencia de rango r, decodificación, gradientes y aprendizaje sintético. |
 | `tests/test_assoc.py` | 4 tests con casos a mano de la métrica de asociación, los cruces y "ninguna". |
 | `tests/test_train.py` | 9 tests en CPU (~3 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
@@ -59,6 +62,22 @@ candidata correcta y no en la vecina. Pesos por defecto: `--w-assoc 2`, caja `--
 Métricas: `val_assoc_head` (elige `best.pth`, `--select head`) frente a `val_assoc_prev`, `val_assoc_app` (solo apariencia: ¿aprende a
 reidentificar?), `val_cross_*` en cruces, `val_null_recall` y `val_null_false`. El log de cada época imprime también los tres pesos aprendidos.
 `diagnose.py` añade las columnas `asoc_cabeza` y `asoc_apariencia` y los bloques `ninguna` y `pesos`. Con checkpoints de v1/v2 omite la cabeza.
+
+## Tracker en línea y evaluación (`track.py`)
+El acierto por pares no es HOTA: falta la asignación uno a uno, los nacimientos, las muertes y los huecos largos. `track.py` recorre cada
+secuencia de val con un forward del detector por frame y mantiene, por track, el `emb` y la caja de su última detección asignada. En cada frame:
+1. Candidatas: detecciones con score ≥ `--det-thr` (el del entrenamiento, 0.3).
+2. Puntuación: modo `head`, log-softmax de `assoc_logits` (más `--null-bias` en "ninguna"); modo `iou`, IoU con la última caja, y
+   "ninguna" = `--iou-min` (0.3).
+3. Hungarian global con una columna "ninguna" propia por track.
+4. Nacimientos: candidatas sin asignar con score ≥ `--birth-thresh` (0.5) y NMS `--birth-nms` (0.7). Muerte: más de `--max-lost`
+   (30) frames sin asignar.
+Los dos modos comparten detecciones, nacimientos y muertes: su diferencia es lo que aporta la cabeza. Ojo: con huecos largos el track
+puede estar hasta 30 frames sin ver, y la cabeza se entrenó con k ≤ 10.
+```bash
+sbatch slurm/trackheads_track.sbatch                       # $OUTPUT_ROOT/trackheads/trackheads_v3/track_default/{table.md,head.json,iou.json}
+TAG=nb1 TRACK_EXTRA="--null-bias 1 --max-lost 20" sbatch slurm/trackheads_track.sbatch
+```
 
 ## Entrenamiento
 ```bash
