@@ -35,3 +35,12 @@ def build_tracks(q, tid, gt_tk, det_thr=0.3, max_tracks=64):
             out['present'][b, :n] = has.float()
             out['target_box'][b, :n][has] = g[eq.float().argmax(1)[has], 1:5].float()
     return out
+
+
+def assoc_targets(track_id, tid_k, cand):
+    """track_id (B,T), tid_k (B,C) identidades de las detecciones de t+k (-1 = fondo), cand (B,C) bool (candidatas).
+    -> (B,T) long: índice de la candidata con la misma identidad, o C ("ninguna") si no la hay (ausente o no detectada con score suficiente).
+    El Hungarian del detector da como mucho una detección por identidad."""
+    C = tid_k.shape[1]
+    eq = (track_id[:, :, None] == tid_k[:, None, :]) & (tid_k[:, None, :] >= 0) & cand[:, None, :]
+    return torch.where(eq.any(-1), eq.float().argmax(-1), torch.full_like(track_id, C))

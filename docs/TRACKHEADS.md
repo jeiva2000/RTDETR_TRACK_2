@@ -6,17 +6,17 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 
 | Archivo | Contenido |
 |---|---|
-| `model.py` | `TrackHeads` (memoria, atención por cabeza, lectura, salida), `HeadGenerator` (hipernetwork: q_i, U_i, V_i), `sine_2d`, `token_centers`. |
+| `model.py` | `TrackHeads` (memoria, atención por cabeza, lectura, salida), `HeadGenerator` (hipernetwork: q_i, U_i, V_i), `Associator` (puntuación track × detección candidata de t+k, más "ninguna"), `sine_2d`, `token_centers`. |
 | `detector.py` | `FrozenDetector`: `QueryExtractor` + hook en el encoder. `detect(images, gts)` -> top-K queries, track ID (Hungarian del detector) y los 3 mapas del encoder. |
 | `data.py` | `PairDataset`: pares (t, t+k) de DanceTrack con k ~ U{k_min..k_max}; imágenes 640×640 y GT de los dos frames. Val: pares fijos. |
-| `targets.py` | `build_tracks`: tracks del frame t y objetivos en t+k (presencia y caja GT). |
-| `losses.py` | `trackheads_loss` (L1 + GIoU, BCE de presencia, atención auxiliar) y las métricas (`batch_stats`, `summarize`). |
+| `targets.py` | `build_tracks`: tracks del frame t y objetivos en t+k (presencia y caja GT). `assoc_targets`: índice de la candidata correcta de t+k o "ninguna". |
+| `losses.py` | `trackheads_loss` (entropía cruzada de asociación, L1 + GIoU, BCE de presencia, atención auxiliar) y las métricas (`batch_stats`, `summarize`). |
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
-| `assoc.py` | Acierto de asociación: si la caja predicha (o la atención) apunta a la detección correcta de t+k, frente a hacerlo con prev_box; en total y en cruces. Es la métrica que elige `best.pth`. |
+| `assoc.py` | Acierto de asociación: si el Associator (o su término de apariencia, la caja predicha o la atención) elige la detección correcta de t+k, frente a hacerlo por IoU con prev_box; en total y en cruces; y la clase "ninguna". `val_assoc_head` elige `best.pth`. |
 | `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k y en cruces: acierto de asociación (pred, prev_box, atención); IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
 | `tests/test_model.py` | 12 tests en CPU (~5 s): formas, orden de los tokens, inicialización identidad, prior, independencia entre tracks, equivalencia de rango r, decodificación, gradientes y aprendizaje sintético. |
-| `tests/test_assoc.py` | 3 tests con casos a mano de la métrica de asociación y de los cruces. |
-| `tests/test_train.py` | 7 tests en CPU (~2 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
+| `tests/test_assoc.py` | 4 tests con casos a mano de la métrica de asociación, los cruces y "ninguna". |
+| `tests/test_train.py` | 9 tests en CPU (~3 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
 | `slurm/trackheads.sbatch` | Lanzamiento en el clúster (1 GPU). |
 
 ```python
@@ -24,7 +24,9 @@ from tracking.trackheads import TrackHeads
 m = TrackHeads()          # D=256, d_h=64, r=8, 3 niveles, use_prior=True, log_scale=log(2), s_min=0.02
 out = m(emb, prev_box, feats, track_mask)
 # emb (B,T,256)  prev_box (B,T,4) cxcywh  feats [3×(B,256,H,W)] del frame t+k (strides 8/16/32)  track_mask (B,T)
-# -> boxes (B,T,4), presence_logits (B,T), attn (B,T,N), token_xy (N,2), track_mask
+# -> boxes (B,T,4), presence_logits (B,T), attn (B,T,N), token_xy (N,2), track_mask, feat (lectura v), emb
+out = m.associate(out, emb_k, box_k, cand)      # detecciones de t+k: emb_k (B,C,256), box_k (B,C,4), cand (B,C) score >= det_thr
+# -> + assoc_logits (B,T,C+1) (última columna = "ninguna"), assoc_app (B,T,C) (solo el término de apariencia)
 ```
 
 ## Decisiones de implementación (lo que la especificación no fijaba)
@@ -40,25 +42,45 @@ out = m(emb, prev_box, feats, track_mask)
   deben enmascararlos con `track_mask`.**
 - Tamaño: unos 1.0 M de parámetros. Forward+backward con B=2, T=100, N=8400 tarda unos 0.05 s en CPU.
 
+## Asociación (desde trackheads_v3)
+trackheads_v2 mostró que la regresión de caja se queda en prev_box: acierto de asociación 0.8735 frente a 0.8736 de prev_box (0.7922 frente a
+0.7924 en cruces). Asociar por la atención daba 0.66: la pérdida de masa en la caja GT se cumple cubriendo la zona de prev_box, que solapa
+con el objetivo, y nada obliga a distinguir a la persona de al lado. La presencia tampoco aprendió (recall de ausentes 0, con un 2.5 % de ausentes).
+Por eso la pérdida principal pasa a ser la **elección de la detección correcta de t+k**. Para el track i y cada candidata j (detección de
+t+k con score ≥ `--det-thr`):
+
+s_ij = escala·cos(MLP([v_i, emb_i]), MLP([emb_j, caja_j])) + w_masa·log(masa de attn_i dentro de la caja j) + w_iou·IoU(caja predicha_i, caja j)
+
+más un logit "ninguna" (MLP([v_i, emb_i])). Entropía cruzada con objetivo = la candidata con la identidad del track, o "ninguna" si no la hay
+(ausente o sin detección con score suficiente; esos casos dan negativos además de las salidas de escena). Los pesos escala (10), w_masa (1) y
+w_iou (5) son aprendibles: al inicio la caja predicha es prev_box y la puntuación es un tracker por IoU, de modo que la cabeza empieza en la
+referencia y solo tiene que aprender a corregirla. El término de masa lleva el gradiente a la atención, que tiene que concentrarse en la
+candidata correcta y no en la vecina. Pesos por defecto: `--w-assoc 2`, caja `--w-l1 1 --w-giou 0.5`, `--w-attn 0.5`, presencia 1.
+Métricas: `val_assoc_head` (elige `best.pth`, `--select head`) frente a `val_assoc_prev`, `val_assoc_app` (solo apariencia: ¿aprende a
+reidentificar?), `val_cross_*` en cruces, `val_null_recall` y `val_null_false`. El log de cada época imprime también los tres pesos aprendidos.
+`diagnose.py` añade las columnas `asoc_cabeza` y `asoc_apariencia` y los bloques `ninguna` y `pesos`. Con checkpoints de v1/v2 omite la cabeza.
+
 ## Entrenamiento
 ```bash
 python -m tracking.trackheads.tests.test_model && python -m tracking.trackheads.tests.test_train    # tests (CPU, segundos)
 sbatch slurm/trackheads.sbatch      # entrena y al terminar diagnostica best.pth; detector: $OUTPUT_ROOT/detector_r50vd_person/best.pth (o DET_CKPT=...)
 RUN_NAME=th_noattn EXTRA="--w-attn 0" sbatch slurm/trackheads.sbatch   # ablación: sin la pérdida auxiliar de atención
 ```
-Salida en `$OUTPUT_ROOT/trackheads/<RUN_NAME>/` (por defecto `trackheads_v2`): `best.pth` (mejor métrica de `--select`), `last.pth` (reanudación), `log.txt` (una línea JSON por época), `args.json` y `diagnose.json` (el diagnóstico final, también impreso en el log del trabajo). Relanzar con el mismo `RUN_NAME` reanuda si se cortó por tiempo; si terminó, solo repite el diagnóstico. No reanuda una ejecución entrenada con otro `--select`.
+Salida en `$OUTPUT_ROOT/trackheads/<RUN_NAME>/` (por defecto `trackheads_v3`): `best.pth` (mejor métrica de `--select`), `last.pth` (reanudación), `log.txt` (una línea JSON por época), `args.json` y `diagnose.json` (el diagnóstico final, también impreso en el log del trabajo). Relanzar con el mismo `RUN_NAME` reanuda si se cortó por tiempo; si terminó, solo repite el diagnóstico. No reanuda una ejecución entrenada con otro `--select`.
 
 **Receta.** Cada paso toma B pares (t, t+k) y hace **un** forward del detector congelado con los 2B frames. Los mapas del encoder no se
 cachean (unos 8.6 MB por frame en fp32). Los **tracks** son las detecciones del frame t emparejadas con una identidad GT por el Hungarian
 del detector, con IoU ≥ `--min-iou` (0.5) y score ≥ `--det-thr` (0.3); como mucho `--max-tracks` (64). `emb` y `prev_box` son los del
 detector, no los del GT, como en inferencia. **Objetivos**: presente si la identidad está en el GT de t+k; en ese caso, la caja GT de t+k.
-**Pérdida**: `5·L1 + 2·(1−GIoU)` solo en tracks presentes, más `1·BCE(presencia)` y `1·[−log masa de la atención dentro de la caja GT]`.
+**Pérdida** (v3): `2·CE(asociación)` en todos los tracks, `1·L1 + 0.5·(1−GIoU)` solo en tracks presentes, `1·BCE(presencia)` y
+`0.5·[−log masa de la atención dentro de la caja GT]` (v1/v2: sin asociación, caja 5 y 2, atención 1).
 **Optimización**: AdamW con lr 1e-4 y wd 1e-4, warmup de 500 pasos y coseno, clip 1.0, 30 épocas de 8000 pares, parada tras 6 épocas sin
-mejorar `val_iou`. k ~ U{1..10} (DanceTrack va a 20 fps, así que hasta 0.5 s).
+mejorar la métrica de `--select`. k ~ U{1..10} (DanceTrack va a 20 fps, así que hasta 0.5 s).
 
 **Qué se optimiza y qué se mide.** La pérdida es de caja y presencia, pero el objetivo es la **identidad**. La caja del detector en t+k
 siempre será mejor que la predicha, así que la cabeza no tiene que competir con ella: tiene que apuntar a la detección correcta. Por eso
-`best.pth` y la parada temprana usan `val_assoc_pred` (`--select assoc`, por defecto; `--select iou` recupera el criterio anterior). Esta
+`best.pth` y la parada temprana usan una métrica de asociación: `val_assoc_head` (`--select head`, por defecto desde v3), o
+`val_assoc_pred` (`--select assoc`, v2); `--select iou` es el criterio de v1. Esta
 métrica es el acierto al elegir, entre las detecciones de t+k con score ≥ `--det-thr`, la de mayor IoU con la caja predicha. Se compara con
 `val_assoc_prev` (lo mismo con prev_box: un tracker por IoU sin movimiento) y con `val_assoc_attn` (la detección con más masa de la
 atención). Las mismas tres métricas en cruces (`val_cross_*`, cajas GT con IoU > `--cross-iou` 0.3 en t o t+k) son el caso donde prev_box

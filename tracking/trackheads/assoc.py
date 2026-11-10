@@ -5,10 +5,15 @@ positivos), se elige una candidata con tres reglas y se mira si es la misma iden
 - pred: la de mayor IoU con la caja predicha por la cabeza.
 - prev: la de mayor IoU con prev_box (la caja del frame t): un tracker por IoU sin movimiento, la referencia a batir.
 - attn: la que contiene más masa de la atención de la cabeza (usa la atención directamente como señal de asociación).
+- head: la de mayor puntuación del Associator (out['assoc_logits'], sin la clase "ninguna"); app: solo su término de apariencia.
+"ninguna" (si hay assoc_logits): entre los tracks sin candidata de su identidad, fracción en que gana "ninguna" (null_recall); entre los válidos,
+fracción en que gana "ninguna" aunque la candidata correcta exista (null_false).
 cruce: la caja GT del track solapa (IoU > cross_iou) con la de otra identidad en t o en t+k; es donde prev falla y la apariencia debería ayudar."""
 import torch
 
 from tracking.trackheads.losses import box_iou
+
+ROUTES = ('pred', 'prev', 'attn', 'head', 'app')
 
 
 def _cross(ids, gt, thr):
@@ -45,17 +50,29 @@ def assoc_flags(out, tg, box_k, sc_k, tid_k, gt_t, gt_tk, det_thr=0.3, cross_iou
              ((y[None, None] - box_k[..., 1, None]).abs() <= box_k[..., 3, None] / 2)          # (B,C,N)
     mass = torch.bmm(out['attn'], inside.transpose(1, 2).to(out['attn'].dtype))               # (B,T,C)
     cross = gt_cross(ids, gt_t, gt_tk, cross_iou)
-    return dict(valid=valid, ok_pred=pick(box_iou(out['boxes'][:, :, None], box_k[:, None])),
-                ok_prev=pick(box_iou(tg['prev_box'][:, :, None], box_k[:, None])), ok_attn=pick(mass), cross=cross & valid)
+    f = dict(valid=valid, ok_pred=pick(box_iou(out['boxes'][:, :, None], box_k[:, None])),
+             ok_prev=pick(box_iou(tg['prev_box'][:, :, None], box_k[:, None])), ok_attn=pick(mass), cross=cross & valid)
+    if 'assoc_logits' in out:
+        C = box_k.shape[1]
+        lg = out['assoc_logits']
+        f['ok_head'], f['ok_app'] = pick(lg[..., :C]), pick(out['assoc_app'])
+        is_null = lg.argmax(-1) == C
+        f['no_cand'] = tg['track_mask'] & ~is_true.any(-1)
+        f['null_ok'] = f['no_cand'] & is_null
+        f['null_false'] = valid & is_null
+    return f
 
 
 def assoc_sums(f):
     """Sumas para agregar en la época (total y cruces)."""
     v, c = f['valid'], f['cross']
     s = dict(assoc_n=int(v.sum()), cross_n=int(c.sum()))
-    for r in ('pred', 'prev', 'attn'):
-        s[f'assoc_{r}'] = int(f[f'ok_{r}'].sum())
-        s[f'cross_{r}'] = int((f[f'ok_{r}'] & c).sum())
+    for r in ROUTES:
+        if f'ok_{r}' in f:
+            s[f'assoc_{r}'] = int(f[f'ok_{r}'].sum())
+            s[f'cross_{r}'] = int((f[f'ok_{r}'] & c).sum())
+    if 'no_cand' in f:
+        s.update(null_n=int(f['no_cand'].sum()), null_ok=int(f['null_ok'].sum()), null_false=int(f['null_false'].sum()))
     return s
 
 
@@ -64,7 +81,11 @@ def assoc_summary(acc):
     out = dict(assoc_n=acc.get('assoc_n', 0), cross_n=acc.get('cross_n', 0))
     for g in ('assoc', 'cross'):
         n = acc.get(f'{g}_n', 0)
-        for r in ('pred', 'prev', 'attn'):
-            out[f'{g}_{r}'] = acc[f'{g}_{r}'] / n if n else None
+        for r in ROUTES:
+            out[f'{g}_{r}'] = acc[f'{g}_{r}'] / n if n and f'{g}_{r}' in acc else None
         out[f'{g}_gain'] = (acc[f'{g}_pred'] - acc[f'{g}_prev']) / n if n else None
+        out[f'{g}_head_gain'] = (acc[f'{g}_head'] - acc[f'{g}_prev']) / n if n and f'{g}_head' in acc else None
+    out['null_n'] = acc.get('null_n', 0)
+    out['null_recall'] = acc['null_ok'] / acc['null_n'] if acc.get('null_n') else None
+    out['null_false'] = acc['null_false'] / acc['assoc_n'] if 'null_false' in acc and acc.get('assoc_n') else None
     return out

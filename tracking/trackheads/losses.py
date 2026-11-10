@@ -2,7 +2,9 @@
 - box: w_l1·L1 + w_giou·(1 − GIoU) sobre (cx, cy, w, h).
 - presence: BCE con logits (pos_weight opcional: en DanceTrack casi todos los tracks siguen presentes).
 - attn (auxiliar): −log(masa de la atención dentro de la caja GT de t+k). Los tracks sin ningún token dentro de su caja no cuentan.
-  Motivo: con la caja como única señal la atención aprende muy despacio (ver docs/TRACKHEADS.md)."""
+  Motivo: con la caja como única señal la atención aprende muy despacio (ver docs/TRACKHEADS.md).
+- assoc (la principal desde trackheads_v3): entropía cruzada sobre las detecciones candidatas de t+k + "ninguna" (out['assoc_logits'],
+  objetivo tg['assoc_target'], targets.assoc_targets), en todos los tracks (también los ausentes: su objetivo es "ninguna")."""
 import torch
 import torch.nn.functional as F
 
@@ -25,7 +27,7 @@ def attn_mass_in_box(attn, token_xy, box):
     return (attn * inside).sum(-1), inside.sum(-1)
 
 
-def trackheads_loss(out, tg, w_l1=5.0, w_giou=2.0, w_pres=1.0, w_attn=1.0, pos_weight=1.0):
+def trackheads_loss(out, tg, w_l1=5.0, w_giou=2.0, w_pres=1.0, w_attn=1.0, pos_weight=1.0, w_assoc=0.0):
     """out: salida de TrackHeads; tg: build_tracks. -> (pérdida total, dict de partes como floats)."""
     m = tg['track_mask']
     pm = m & (tg['present'] > 0.5)
@@ -47,8 +49,12 @@ def trackheads_loss(out, tg, w_l1=5.0, w_giou=2.0, w_pres=1.0, w_attn=1.0, pos_w
         ok = pm & (n_in > 0)
         if ok.any():
             la = -(mass[ok] + 1e-6).log().mean()
-    total = w_l1 * l1 + w_giou * lg + w_pres * lp + w_attn * la
-    return total, {k: v.item() for k, v in dict(loss=total.detach(), l1=l1.detach(), giou=lg.detach(), pres=lp.detach(), attn=la.detach()).items()}
+    ls = zero
+    if w_assoc > 0 and m.any() and 'assoc_logits' in out:
+        ls = F.cross_entropy(out['assoc_logits'][m].float(), tg['assoc_target'][m])
+    total = w_l1 * l1 + w_giou * lg + w_pres * lp + w_attn * la + w_assoc * ls
+    parts = dict(loss=total, l1=l1, giou=lg, pres=lp, attn=la, assoc=ls)
+    return total, {k: v.detach().item() for k, v in parts.items()}
 
 
 @torch.no_grad()

@@ -38,6 +38,25 @@ def test_flags():
     assert s['assoc_n'] == 1 and s['assoc_pred'] == 1.0 and s['assoc_prev'] == 0.0 and s['assoc_gain'] == 1.0 and s['cross_n'] == 1
 
 
+def test_head_flags_and_null():
+    out, tg, box_k, sc_k, tid_k, gt_t, gt_tk = _case()
+    C = box_k.shape[1]
+    # track 0 (válido): la cabeza elige la candidata 0 (identidad 1, acierta); la apariencia elige la 1 (falla).
+    # track 1 (identidad 3, sin candidata: su detección tiene score bajo): gana "ninguna" (acierta). Track 2: relleno.
+    lg = torch.full((1, 3, C + 1), -5.0)
+    lg[0, 0, 0], lg[0, 1, C] = 3.0, 2.0
+    app = torch.zeros(1, 3, C); app[0, 0, 1] = 1.0
+    out = dict(out, assoc_logits=lg, assoc_app=app)
+    f = assoc_flags(out, tg, box_k, sc_k, tid_k, gt_t, gt_tk)
+    assert f['ok_head'].tolist() == [[True, False, False]] and f['ok_app'].tolist() == [[False, False, False]]
+    assert f['no_cand'].tolist() == [[False, True, False]] and f['null_ok'].tolist() == [[False, True, False]] and not f['null_false'].any()
+    s = assoc_summary(assoc_sums(f))
+    assert s['assoc_head'] == 1.0 and s['assoc_app'] == 0.0 and s['assoc_head_gain'] == 1.0 and s['null_recall'] == 1.0 and s['null_false'] == 0.0
+    lg[0, 0, C] = 9.0                                                                 # ahora "ninguna" gana aunque la correcta existe
+    f = assoc_flags(dict(out, assoc_logits=lg), tg, box_k, sc_k, tid_k, gt_t, gt_tk)
+    assert assoc_summary(assoc_sums(f))['null_false'] == 1.0
+
+
 def test_gt_cross():
     gt = [torch.tensor([[1, .2, .5, .2, .2], [2, .25, .5, .2, .2], [3, .8, .5, .1, .1]])]
     far = [torch.tensor([[1, .1, .5, .1, .1], [2, .5, .5, .1, .1], [3, .9, .5, .05, .05]])]
@@ -50,7 +69,7 @@ def test_no_candidates_and_empty():
     f = assoc_flags(out, tg, box_k, torch.zeros_like(sc_k), tid_k, gt_t, gt_tk)
     assert not f['valid'].any() and not f['ok_pred'].any()
     s = assoc_summary(assoc_sums(f))
-    assert s['assoc_pred'] is None and s['assoc_gain'] is None
+    assert s['assoc_pred'] is None and s['assoc_gain'] is None and s['assoc_head'] is None and s['null_recall'] is None
 
 
 if __name__ == '__main__':

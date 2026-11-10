@@ -20,7 +20,7 @@ eval "$(conda shell.bash hook)"
 source setup_env/load.sh hpc
 conda activate "$CONDA_ENV"
 DET_CKPT="${DET_CKPT:-$OUTPUT_ROOT/detector_r50vd_person/best.pth}"
-RUN_NAME="${RUN_NAME:-trackheads_v2}"            # v1 se entrenó eligiendo por IoU; no se puede reanudar con el criterio de asociación
+RUN_NAME="${RUN_NAME:-trackheads_v3}"            # v3: pérdida de asociación (Associator). v1/v2 usan otro --select: no se reanudan
 OUT="$OUTPUT_ROOT/trackheads/$RUN_NAME"
 [ -f "$DET_CKPT" ] || { echo "ERROR: no existe el checkpoint del detector $DET_CKPT (define DET_CKPT)" >&2; exit 1; }
 

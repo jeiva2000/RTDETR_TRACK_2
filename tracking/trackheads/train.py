@@ -1,8 +1,9 @@
 """Entrenamiento de TrackHeads (etapa 1) con el RT-DETRv2 congelado, en línea (los mapas del encoder no se cachean: ~8.6 MB por frame).
 Cada paso: un lote de pares (t, t+k) -> UN forward del detector sobre los 2B frames -> tracks del frame t (detecciones emparejadas con el GT)
-y memoria del frame t+k -> TrackHeads -> pérdida (caja + presencia + atención auxiliar). Solo se entrena TrackHeads.
-Validación: pares fijos de val. Métrica principal (--select assoc, por defecto): acierto de ASOCIACIÓN, si la caja predicha apunta a la
-detección correcta de t+k, frente a hacerlo con prev_box (assoc_gain), en total y en cruces (assoc.py). También: IoU de la caja frente a
+y memoria del frame t+k -> TrackHeads -> puntuación contra las detecciones candidatas de t+k (Associator) -> pérdida: entropía cruzada de
+asociación (la principal) + caja + presencia + atención auxiliar. Solo se entrena TrackHeads.
+Validación: pares fijos de val. Métrica principal (--select head, por defecto): acierto de ASOCIACIÓN del Associator (elige la detección
+correcta de t+k), frente a hacerlo por IoU con prev_box (assoc_head_gain), en total y en cruces (assoc.py). --select assoc usa la caja predicha. También: IoU de la caja frente a
 prev_box (iou_gain), acierto de presencia y masa de la atención en la caja GT. best.pth = mejor métrica de val; last.pth permite reanudar.
 Uso: python -m tracking.trackheads.train --det-ckpt $OUTPUT_ROOT/detector_r50vd_person/best.pth --out $OUTPUT_ROOT/trackheads/<run> [...]"""
 import argparse, json, math, os, random, sys, time
@@ -15,10 +16,10 @@ from tracking.trackheads.assoc import assoc_flags, assoc_sums, assoc_summary
 from tracking.trackheads.data import PairDataset, collate
 from tracking.trackheads.losses import batch_stats, summarize, trackheads_loss
 from tracking.trackheads.model import TrackHeads
-from tracking.trackheads.targets import build_tracks
+from tracking.trackheads.targets import assoc_targets, build_tracks
 
 
-SELECT = dict(assoc='val_assoc_pred', iou='val_iou')   # métrica de val que elige best.pth y controla la parada temprana
+SELECT = dict(head='val_assoc_head', assoc='val_assoc_pred', iou='val_iou')   # métrica de val que elige best.pth y controla la parada temprana
 
 
 def build_model(a):
@@ -32,11 +33,16 @@ def run_batch(det, model, batch, a, device):
     q_t = {k: v[:B] for k, v in q.items()}
     tg = build_tracks(q_t, tid[:B], batch['gt_tk'], a.det_thr, a.max_tracks)
     out = model(tg['emb'], tg['prev_box'], [f[B:] for f in feats], tg['track_mask'])
-    return out, tg, dict(box_k=q['boxes'][B:], sc_k=q['scores'][B:], tid_k=tid[B:])
+    box_k, sc_k, tid_k = q['boxes'][B:], q['scores'][B:], tid[B:]
+    if getattr(a, 'assoc', True):                       # False solo al diagnosticar checkpoints anteriores al Associator
+        cand = sc_k >= a.det_thr
+        model.associate(out, q['emb'][B:], box_k, cand)
+        tg['assoc_target'] = assoc_targets(tg['track_id'], tid_k, cand)
+    return out, tg, dict(box_k=box_k, sc_k=sc_k, tid_k=tid_k)
 
 
 def loss_kw(a):
-    return dict(w_l1=a.w_l1, w_giou=a.w_giou, w_pres=a.w_pres, w_attn=a.w_attn, pos_weight=a.pos_weight)
+    return dict(w_l1=a.w_l1, w_giou=a.w_giou, w_pres=a.w_pres, w_attn=a.w_attn, pos_weight=a.pos_weight, w_assoc=getattr(a, 'w_assoc', 0.0))
 
 
 def add(acc, st):
@@ -137,8 +143,12 @@ def main(a, detector=None):
         rec.update(select=SELECT[a.select], best_val=best, improved=improved)
         log.write(json.dumps(rec) + '\n'); log.flush()
         fmt = lambda v: 'n/a' if v is None else f'{v:.4f}'
-        print(f"ep {ep} | val asociación {fmt(rec['val_assoc_pred'])} (prev_box {fmt(rec['val_assoc_prev'])}, atención {fmt(rec['val_assoc_attn'])}) "
-              f"cruces {fmt(rec['val_cross_pred'])} (prev_box {fmt(rec['val_cross_prev'])}, n={rec['val_cross_n']}) | val iou {rec['val_iou']:.4f} (prev_box {rec['val_iou_prev']:.4f}, ganancia {rec['val_iou_gain']:+.4f}) "
+        w = model.assoc
+        print(f"ep {ep} | val asociación cabeza {fmt(rec['val_assoc_head'])} (prev_box {fmt(rec['val_assoc_prev'])}, caja {fmt(rec['val_assoc_pred'])}, "
+              f"apariencia {fmt(rec['val_assoc_app'])}, atención {fmt(rec['val_assoc_attn'])}) "
+              f"cruces cabeza {fmt(rec['val_cross_head'])} (prev_box {fmt(rec['val_cross_prev'])}, apariencia {fmt(rec['val_cross_app'])}, n={rec['val_cross_n']}) "
+              f"ninguna recall {fmt(rec['val_null_recall'])} (n={rec['val_null_n']}) falsas {fmt(rec['val_null_false'])} "
+              f"| pesos esc_apar {w.log_app.exp().item():.2f} masa {w.w_mass.item():.2f} iou {w.w_iou.item():.2f} | val iou {rec['val_iou']:.4f} (prev_box {rec['val_iou_prev']:.4f}, ganancia {rec['val_iou_gain']:+.4f}) "
               f"iou50 {rec['val_iou50']:.3f} pres_acc {rec['val_pres_acc']:.3f} attn_mass {rec['val_attn_mass']:.3f} "
               f"| train loss {rec['train_loss']:.4f} | {rec['time']}s{' *' if improved else ''}", flush=True)
         stop = bool(a.patience and bad >= a.patience)
@@ -173,7 +183,7 @@ def parser():
     p.add_argument('--det-thr', type=float, default=0.3, help='score mínimo de una detección para ser track')
     p.add_argument('--max-tracks', type=int, default=64)
     p.add_argument('--cross-iou', type=float, default=0.3, help='IoU entre cajas GT a partir del cual un track está en un cruce (métrica)')
-    p.add_argument('--select', choices=list(SELECT), default='assoc', help='métrica de val para best.pth y la parada temprana')
+    p.add_argument('--select', choices=list(SELECT), default='head', help='métrica de val para best.pth y la parada temprana')
     # modelo
     p.add_argument('--d-h', type=int, default=64)
     p.add_argument('--rank', type=int, default=8)
@@ -189,10 +199,11 @@ def parser():
     p.add_argument('--resume', action='store_true')
     p.add_argument('--print-every', type=int, default=100)
     # pérdida
-    p.add_argument('--w-l1', type=float, default=5.0)
-    p.add_argument('--w-giou', type=float, default=2.0)
+    p.add_argument('--w-assoc', type=float, default=2.0, help='entropía cruzada de asociación (la pérdida principal)')
+    p.add_argument('--w-l1', type=float, default=1.0, help='caja: auxiliar (trackheads_v1/v2 usaban 5)')
+    p.add_argument('--w-giou', type=float, default=0.5, help='caja: auxiliar (trackheads_v1/v2 usaban 2)')
     p.add_argument('--w-pres', type=float, default=1.0)
-    p.add_argument('--w-attn', type=float, default=1.0, help='pérdida auxiliar de atención (0 = solo caja y presencia)')
+    p.add_argument('--w-attn', type=float, default=0.5, help='pérdida auxiliar de atención (0 = solo caja y presencia)')
     p.add_argument('--pos-weight', type=float, default=1.0, help='pos_weight de la BCE de presencia (<1 pesa más los ausentes)')
     return p
 

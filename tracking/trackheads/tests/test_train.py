@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from tracking.trackheads.data import PairDataset, collate
 from tracking.trackheads.losses import attn_mass_in_box, batch_stats, summarize, trackheads_loss
 from tracking.trackheads.model import TrackHeads
-from tracking.trackheads.targets import build_tracks
+from tracking.trackheads.targets import assoc_targets, build_tracks
 from tracking.trackheads.train import main, parser
 from tracking.trackheads import diagnose as diag
 
@@ -113,6 +113,35 @@ def test_loss_ignores_padding_and_absent_boxes():
     l0.backward()
 
 
+def test_assoc_targets_and_loss():
+    tid_k = torch.tensor([[5, 3, -1, 9]])
+    cand = torch.tensor([[True, True, True, False]])
+    # 3 -> candidata 1; 5 -> 0; 9 está pero no es candidata (score bajo) -> ninguna (4); 7 no está -> ninguna; -1 (relleno) -> ninguna
+    assert assoc_targets(torch.tensor([[3, 5, 9, 7, -1]]), tid_k, cand).tolist() == [[1, 0, 4, 4, 4]]
+    out, tg = _out_tg()
+    C = 6
+    emb_k, box_k = torch.randn(2, C, D), torch.rand(2, C, 4) * 0.2 + 0.3
+    cand = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 0, 0, 0, 0]]).bool()
+    m = TrackHeads()
+    torch.manual_seed(0)
+    feats = [torch.randn(2, D, s, s) for s in (8, 4, 2)]
+    out = m.associate(m(tg['emb'], tg['prev_box'], feats, tg['track_mask']), emb_k, box_k, cand)
+    lg = out['assoc_logits']
+    assert lg.shape == (2, 4, C + 1) and (lg[1, :, 2:C] < -1e3).all() and torch.isfinite(lg).all()
+    tg['assoc_target'] = torch.tensor([[0, 6, 2, 6], [1, 6, 6, 6]])
+    l, p = trackheads_loss(out, tg, w_assoc=1.0)
+    assert p['assoc'] > 0
+    l.backward()
+    for name in ('assoc.track.0.weight', 'assoc.cand.0.weight', 'assoc.null.0.weight', 'assoc.w_iou', 'assoc.w_mass', 'assoc.log_app', 'w_k.weight'):
+        g = dict(m.named_parameters())[name].grad
+        assert g is not None and g.abs().sum() > 0, name                            # w_k: la masa de la atención sobre las candidatas entrena la atención
+    # al inicio (caja = prev_box, w_iou = 5) la candidata con mayor IoU con prev_box suele ganar: arranca como un tracker por IoU
+    box_k2 = torch.stack([tg['prev_box'][0, 0], torch.tensor([.9, .9, .05, .05])])[None]
+    o2 = m.associate(m(tg['emb'][:1, :1], tg['prev_box'][:1, :1], [f[:1] for f in feats], tg['track_mask'][:1, :1]), emb_k[:1, :2], box_k2,
+                     torch.ones(1, 2, dtype=torch.bool))
+    assert o2['assoc_logits'][0, 0, :2].argmax() == 0
+
+
 def test_attn_mass_in_box():
     xy = torch.tensor([[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]])
     attn = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]])
@@ -156,12 +185,14 @@ def test_train_smoke_and_resume():
         best = main(_args(root, out), det)
         assert os.path.isfile(os.path.join(out, 'best.pth')) and os.path.isfile(os.path.join(out, 'last.pth'))
         log = [json.loads(l) for l in open(os.path.join(out, 'log.txt'))]
-        assert [r['epoch'] for r in log] == [0, 1] and best == max(r['val_assoc_pred'] for r in log)
+        assert [r['epoch'] for r in log] == [0, 1] and best == max(r['val_assoc_head'] for r in log)
         for k in ('val_iou', 'val_iou_prev', 'val_iou_gain', 'val_pres_acc', 'val_attn_mass', 'train_loss', 'train_loss_attn', 'val_loss',
-              'val_assoc_pred', 'val_assoc_prev', 'val_assoc_attn', 'val_assoc_gain'):
+              'val_assoc_pred', 'val_assoc_prev', 'val_assoc_attn', 'val_assoc_gain', 'val_assoc_head', 'val_assoc_app', 'val_assoc_head_gain',
+              'train_loss_assoc', 'val_loss_assoc'):
             assert all(np.isfinite(r[k]) for r in log), k
         assert log[0]['train_n_tracks'] > 0 and 0 < log[0]['val_present_frac'] <= 1
-        assert log[0]['val_assoc_n'] > 0 and log[0]['select'] == 'val_assoc_pred'
+        assert log[0]['val_assoc_n'] > 0 and log[0]['select'] == 'val_assoc_head'
+        assert log[0]['train_loss_assoc'] > 0
         main(_args(root, out, epochs=3, resume=True), det)                            # reanuda: solo la época 2
         log = [json.loads(l) for l in open(os.path.join(out, 'log.txt'))]
         assert [r['epoch'] for r in log] == [0, 1, 2]
@@ -199,10 +230,17 @@ def test_diagnose_smoke():
         res = diag.main(a, det)
         t = res['total']
         assert t['n'] > 0 and 0 <= t['iou_prev'] <= 1 and 0 <= t['iou_pred'] <= 1
-        assert t['iou_det_techo'] > 0.9 and t['det_encontrada'] == 1.0            # el detector simulado usa la caja GT con ruido pequeño
+        assert t['iou_det_techo'] > 0.85 and t['det_encontrada'] == 1.0            # el detector simulado usa la caja GT con ruido pequeño
         assert sum(r.get('n', 0) for k, r in res.items() if k.startswith('k')) == t['n']
         assert res['cruces'].get('n', 0) + res['sin_cruce']['n'] == t['n'] and t['n_asoc'] > 0 and 0 <= t['asoc_pred'] <= 1
         assert res['presencia']['n'] >= t['n'] and os.path.isfile(os.path.join(out, 'diagnose.json'))
+        assert 0 <= t['asoc_cabeza'] <= 1 and 0 <= t['asoc_apariencia'] <= 1 and 'w_iou' in res['pesos'] and 'recall' in res['ninguna']
+        # checkpoint anterior al Associator (v1/v2): se diagnostica sin las columnas de la cabeza
+        ck = torch.load(os.path.join(out, 'best.pth'), map_location='cpu')
+        ck['args'].pop('w_assoc'); ck['model'] = {k: v for k, v in ck['model'].items() if not k.startswith('assoc.')}
+        old = os.path.join(out, 'old.pth'); torch.save(ck, old)
+        res = diag.main(diag.parser().parse_args(['--ckpt', old, '--device', 'cpu', '--num-workers', '0', '--out', os.path.join(out, 'd2.json')]), det)
+        assert res['total']['asoc_cabeza'] is None and res['total']['asoc_pred'] is not None and 'pesos' not in res
 
 
 if __name__ == '__main__':

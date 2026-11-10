@@ -15,6 +15,12 @@ Notación: B lote, T tracks (con relleno y track_mask), N tokens de la memoria a
 5. Salida: MLP de 3 capas sobre [v, emb, shift] -> (δx, δy, δw, δh, logit de presencia), última capa a cero (al inicio la caja es prev_box
    y la presencia 0.5). Caja: cx = cx0 + δx·w0, cy = cy0 + δy·h0, w = w0·exp(clamp(δw,±3)), h = h0·exp(clamp(δh,±3)).
 
+6. Asociación (Associator, TrackHeads.associate): puntúa cada detección candidata j del frame t+k para el track i,
+   s_ij = escala·cos(h_i, c_j) + w_masa·log(masa de attn_i dentro de la caja j) + w_iou·IoU(caja predicha_i, caja j),
+   con h_i = MLP([v_i, emb_i]) y c_j = MLP([emb_j, caja_j]) (query y caja del detector en t+k), más una clase "ninguna" (MLP([v_i, emb_i])) para
+   tracks cuya identidad no está entre las candidatas (ausente o no detectada). Se entrena con entropía cruzada: castiga directamente apuntar
+   a la persona de al lado. w_iou empieza en 5 (al inicio la caja predicha es prev_box: arranca como un tracker por IoU) y w_masa en 1.
+
 Los tracks de relleno (track_mask = False) se calculan igual (valores finitos, independientes del resto: cada cabeza mira solo la memoria)
 y se devuelven sin tocar; las pérdidas deben enmascararlos con track_mask."""
 import math
@@ -72,6 +78,50 @@ class HeadGenerator(nn.Module):
         return self.q(z), U, V
 
 
+def tokens_in_boxes(token_xy, boxes):
+    """token_xy (N,2), boxes (B,C,4) cxcywh -> (B,C,N) bool: el centro del token cae dentro de la caja."""
+    x, y = token_xy[:, 0], token_xy[:, 1]
+    return ((x - boxes[..., 0, None]).abs() <= boxes[..., 2, None] / 2) & ((y - boxes[..., 1, None]).abs() <= boxes[..., 3, None] / 2)
+
+
+def pair_iou(a, b):
+    """a (B,T,4), b (B,C,4) cxcywh -> IoU (B,T,C), diferenciable."""
+    a, b = a[:, :, None], b[:, None]
+    ix = (torch.min(a[..., 0] + a[..., 2] / 2, b[..., 0] + b[..., 2] / 2) - torch.max(a[..., 0] - a[..., 2] / 2, b[..., 0] - b[..., 2] / 2)).clamp(min=0)
+    iy = (torch.min(a[..., 1] + a[..., 3] / 2, b[..., 1] + b[..., 3] / 2) - torch.max(a[..., 1] - a[..., 3] / 2, b[..., 1] - b[..., 3] / 2)).clamp(min=0)
+    inter = ix * iy
+    return inter / (a[..., 2] * a[..., 3] + b[..., 2] * b[..., 3] - inter + 1e-9)
+
+
+NEG = -1e4      # puntuación de las detecciones que no son candidatas (finita: segura con amp y con la entropía cruzada)
+
+
+class Associator(nn.Module):
+    """Puntuación track × detección candidata de t+k (apariencia + atención + geometría) y clase "ninguna"."""
+
+    def __init__(self, dim=256, d_h=64, d_a=128, hidden=256, app_scale=10.0, w_mass=1.0, w_iou=5.0):
+        super().__init__()
+        self.track = mlp(d_h + dim, hidden, d_a)
+        self.cand = mlp(dim + 4, hidden, d_a)
+        self.null = mlp(d_h + dim, hidden, 1)
+        self.log_app = nn.Parameter(torch.tensor(math.log(app_scale)))
+        self.w_mass = nn.Parameter(torch.tensor(float(w_mass)))
+        self.w_iou = nn.Parameter(torch.tensor(float(w_iou)))
+
+    def forward(self, feat, emb, boxes, attn, token_xy, emb_k, box_k, cand):
+        """feat (B,T,d_h) lectura v, emb (B,T,D), boxes (B,T,4) predichas, attn (B,T,N); emb_k (B,C,D), box_k (B,C,4), cand (B,C) bool.
+        -> logits (B,T,C+1) (la última columna es "ninguna") y sus términos: app, log_mass, iou (B,T,C)."""
+        z = torch.cat([feat, emb], -1)
+        h = F.normalize(self.track(z), dim=-1)
+        c = F.normalize(self.cand(torch.cat([emb_k, box_k], -1)), dim=-1)
+        app = self.log_app.exp() * torch.einsum('bta,bca->btc', h, c)
+        mass = torch.bmm(attn, tokens_in_boxes(token_xy, box_k).transpose(1, 2).to(attn.dtype))
+        log_mass = (mass + 1e-4).log()
+        iou = pair_iou(boxes, box_k)
+        s = (app + self.w_mass * log_mass + self.w_iou * iou).masked_fill(~cand[:, None], NEG)
+        return torch.cat([s, self.null(z)], -1), dict(app=app.masked_fill(~cand[:, None], NEG), log_mass=log_mass, iou=iou)
+
+
 class TrackHeads(nn.Module):
     def __init__(self, dim=256, d_h=64, rank=8, n_levels=3, hidden=256, gen_hidden=256,
                  use_prior=True, scale_init=2.0, min_scale=0.02, max_log_wh=3.0):
@@ -90,6 +140,7 @@ class TrackHeads(nn.Module):
                                  nn.Linear(hidden, 5))
         nn.init.zeros_(self.out[-1].weight)
         nn.init.zeros_(self.out[-1].bias)
+        self.assoc = Associator(dim, d_h, hidden=hidden)
 
     # 1. memoria
     def memory(self, feats):
@@ -134,4 +185,11 @@ class TrackHeads(nn.Module):
         # 5. salida
         o = self.out(torch.cat([v, emb, shift], -1))
         return {'boxes': self.decode(prev_box, o[..., :4]), 'presence_logits': o[..., 4], 'attn': attn,
-                'token_xy': xy, 'track_mask': track_mask}
+                'token_xy': xy, 'track_mask': track_mask, 'feat': v, 'emb': emb}
+
+    def associate(self, out, emb_k, box_k, cand):
+        """6. Añade a out las puntuaciones de asociación contra las detecciones de t+k: emb_k (B,C,D), box_k (B,C,4), cand (B,C) bool
+        (candidatas: score >= det_thr). -> out con assoc_logits (B,T,C+1; la última columna es "ninguna") y assoc_app (B,T,C)."""
+        logits, parts = self.assoc(out['feat'], out['emb'], out['boxes'], out['attn'], out['token_xy'], emb_k, box_k, cand)
+        out['assoc_logits'], out['assoc_app'] = logits, parts['app']
+        return out
