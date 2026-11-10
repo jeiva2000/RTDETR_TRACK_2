@@ -14,9 +14,9 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
 | `assoc.py` | Acierto de asociación: si el Associator (o su término de apariencia, la caja predicha o la atención) elige la detección correcta de t+k, frente a hacerlo por IoU con prev_box; en total y en cruces; y la clase "ninguna". `val_assoc_head` elige `best.pth`. |
 | `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k y en cruces: acierto de asociación (pred, prev_box, atención); IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
-| `track.py` | Tracker en línea sobre secuencias completas de val: modos `head` (Associator + Hungarian) e `iou` (referencia con la misma maquinaria), para evaluar con TrackEval. |
+| `track.py` | Tracker en línea sobre secuencias completas de val: modos `head` (Associator + Hungarian) e `iou` (referencia con la misma maquinaria), con confirmación (`min_hits`), umbral de salida y movimiento constante opcionales; varias configuraciones por pasada del detector. |
 | `slurm/trackheads_track.sbatch` | Tracking de val + TrackEval (global y cruces) + tabla con ByteTrack/OC-SORT del baseline si existen. |
-| `tests/test_track.py` | 2 tests: Hungarian con "ninguna" y humo del tracker y de TrackEval sobre el DanceTrack sintético. |
+| `tests/test_track.py` | 4 tests: Hungarian con "ninguna", confirmación y umbral de salida, movimiento, y humo del tracker y de TrackEval sobre el DanceTrack sintético. |
 | `tests/test_model.py` | 12 tests en CPU (~5 s): formas, orden de los tokens, inicialización identidad, prior, independencia entre tracks, equivalencia de rango r, decodificación, gradientes y aprendizaje sintético. |
 | `tests/test_assoc.py` | 4 tests con casos a mano de la métrica de asociación, los cruces y "ninguna". |
 | `tests/test_train.py` | 9 tests en CPU (~3 s) con un DanceTrack sintético en miniatura y un detector simulado: tracks y objetivos, enmascarado de la pérdida, muestreo de pares, humo de `main()` y reanudación. |
@@ -74,9 +74,31 @@ secuencia de val con un forward del detector por frame y mantiene, por track, el
    (30) frames sin asignar.
 Los dos modos comparten detecciones, nacimientos y muertes: su diferencia es lo que aporta la cabeza. Ojo: con huecos largos el track
 puede estar hasta 30 frames sin ver, y la cabeza se entrenó con k ≤ 10.
+
+**Primera evaluación** (trackheads_v3, val; ByteTrack y OC-SORT con el mismo detector y sus parámetros por defecto):
+
+| | HOTA | DetA | AssA | IDF1 | IDSW |
+|---|---|---|---|---|---|
+| OC-SORT | 49.0 | 75.6 | 31.9 | 47.0 | 2640 |
+| head | 47.7 | 71.2 | 32.1 | 46.1 | 4318 |
+| ByteTrack | 45.2 | 67.4 | 30.5 | 51.3 | 2046 |
+| iou | 41.5 | 68.0 | 25.5 | 37.9 | 6824 |
+
+La cabeza asocia como OC-SORT (AssA) sin modelo de movimiento, pero pierde en DetA e IDSW por la gestión de tracks: escribía toda
+candidata asignada (score ≥ 0.3) y todo track desde que nacía (229k cajas frente a 184k de OC-SORT), con mucha fragmentación.
+
+**Ciclo de vida** (claves por configuración, `--configs "nombre=modo,clave=valor,..."`):
+- `min_hits`: confirmación tras N asignaciones seguidas (o en los N primeros frames, como OC-SORT). Solo se escriben tracks confirmados, y
+  uno sin confirmar muere al fallar un frame.
+- `out_thresh`: las cajas con score menor no se escriben; el track sigue vivo.
+- `motion=1`: centro extrapolado con velocidad constante (media exponencial `motion_ema`, como mucho `motion_max` frames). Se usa como
+  prev_box de la cabeza o para el IoU. La cabeza se entrenó con prev_box = detección de t, así que esto es un cambio solo de inferencia.
+
+Por defecto, una pasada prueba `head`, `iou`, `head_mh3`, `head_mh3_mot`, `iou_mh3_mot`, `head_mh3_mot_out05` y `head_mh3_mot_b06`
+(`DEFAULT_CONFIGS` en `track.py`). Elegir la mejor sobre val da números optimistas: hay que fijarla y no seguir ajustando.
 ```bash
-sbatch slurm/trackheads_track.sbatch                       # $OUTPUT_ROOT/trackheads/trackheads_v3/track_default/{table.md,head.json,iou.json}
-TAG=nb1 TRACK_EXTRA="--null-bias 1 --max-lost 20" sbatch slurm/trackheads_track.sbatch
+sbatch slurm/trackheads_track.sbatch                       # $OUTPUT_ROOT/trackheads/trackheads_v3/track_default/{table.md,<config>.json}
+TAG=x TRACK_EXTRA="--configs a=head,min_hits=3,motion=1,null_bias=1 b=head,min_hits=3,motion=1,max_lost=60" sbatch slurm/trackheads_track.sbatch
 ```
 
 ## Entrenamiento

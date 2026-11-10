@@ -7,11 +7,12 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 # Tracker en línea con TrackHeads sobre DanceTrack val (tracking/trackheads/track.py), evaluado con TrackEval (HOTA, DetA, AssA, IDF1, IDSW;
-# global y en cruces), frente al mismo tracker con IoU (mismo detector, nacimientos y muertes) y, si existen, ByteTrack y OC-SORT del baseline.
+# global y en cruces). Por defecto prueba varias configuraciones en la misma pasada del detector (cabeza / IoU, confirmación min_hits,
+# movimiento, umbrales; ver DEFAULT_CONFIGS en track.py) y añade ByteTrack y OC-SORT del baseline si existen.
 # Añadir --partition / --account según el clúster. Desde la raíz del repo (con mkdir -p logs):
 #   sbatch slurm/trackheads_track.sbatch                                   # usa $OUTPUT_ROOT/trackheads/trackheads_v3/best.pth
-#   RUN_NAME=trackheads_v3 TAG=nb1 TRACK_EXTRA="--null-bias 1" sbatch slurm/trackheads_track.sbatch
-# Resultados en $OUTPUT_ROOT/trackheads/$RUN_NAME/track_$TAG/: <modo>/<seq>.txt, <modo>.json y table.md (también en el log).
+#   TAG=nb1 TRACK_EXTRA="--configs a=head,min_hits=3,motion=1,null_bias=1 b=head,min_hits=3,motion=1,max_lost=60" sbatch slurm/trackheads_track.sbatch
+# Resultados en $OUTPUT_ROOT/trackheads/$RUN_NAME/track_$TAG/: <config>/<seq>.txt, <config>.json y table.md (también en el log).
 set -euo pipefail
 module load GCC/12.2.0 CUDA/11.8.0
 eval "$(conda shell.bash hook)"
@@ -30,13 +31,15 @@ python -m tracking.trackheads.track --ckpt "$CKPT" --out "$OUT" --root "$DANCETR
   --num-workers "${SLURM_CPUS_PER_TASK:-6}" ${TRACK_EXTRA:-}
 
 echo "== [2/3] TrackEval"
-SEQS=$(cd "$OUT/head" && ls *.txt | sed 's/.txt$//')
+CFGS=$(cd "$OUT" && ls -d */ | sed 's#/$##')
+FIRST=$(echo "$CFGS" | head -n1)
+SEQS=$(cd "$OUT/$FIRST" && ls *.txt | sed 's/.txt$//')
 ARGS=()
-for M in head iou; do
+for M in $CFGS; do
   # shellcheck disable=SC2086
   python -m tracking.baseline.evaluate --results "$OUT/$M" --gt-root "$VAL" --margin "${MARGIN:-10}" --cross-iou "${CROSS_IOU:-0.3}" \
     --seqs $SEQS --out "$OUT/$M.json" > /dev/null
-  ARGS+=("trackheads_$M=$OUT/$M.json")
+  ARGS+=("$M=$OUT/$M.json")
 done
 for T in bytetrack ocsort; do
   [ -f "$BASE/$T.json" ] && ARGS+=("$T=$BASE/$T.json") || echo "(sin $BASE/$T.json: $T no entra en la tabla)"
