@@ -14,6 +14,9 @@ sigue presente. No usa nada de `tracking/e2e/` salvo el helper `mlp`.
 | `train.py` | Bucle de entrenamiento, validación, checkpoints y reanudación. |
 | `assoc.py` | Acierto de asociación: si el Associator (o su término de apariencia, la caja predicha o la atención) elige la detección correcta de t+k, frente a hacerlo por IoU con prev_box; en total y en cruces; y la clase "ninguna". `val_assoc_head` elige `best.pth`. |
 | `diagnose.py` | Diagnóstico de un checkpoint en val, por tramos de k y en cruces: acierto de asociación (pred, prev_box, atención); IoU de prev_box, de la predicción y techo (caja del detector en t+k); error de centro (prev, predicción, centro atencional) y de tamaño; masa de la atención en la caja GT y en prev_box; presencia. |
+| `train_joint.py` | Ajuste conjunto con el RT-DETRv2 **descongelado** (reutiliza `Detector` de `tracking/joint/train.py`): pérdida de detección completa + λ·TrackHeads, control del DetA, checkpoints del detector. |
+| `slurm/trackheads_joint.sbatch` | Ajuste conjunto desde trackheads_v3 + diagnóstico + tracker y TrackEval. |
+| `tests/test_train_joint.py` | 2 tests en CPU (~15 s, detector real con pesos aleatorios): el gradiente llega a backbone, encoder y decoder; humo de `main()`, diagnóstico y reanudación. |
 | `track.py` | Tracker en línea sobre secuencias completas de val: modos `head` (Associator + Hungarian) e `iou` (referencia con la misma maquinaria), con confirmación (`min_hits`), umbral de salida y movimiento constante opcionales; varias configuraciones por pasada del detector. |
 | `slurm/trackheads_track.sbatch` | Tracking de val + TrackEval (global y cruces) + tabla con ByteTrack/OC-SORT del baseline si existen. |
 | `tests/test_track.py` | 4 tests: Hungarian con "ninguna", confirmación y umbral de salida, movimiento, y humo del tracker y de TrackEval sobre el DanceTrack sintético. |
@@ -99,6 +102,23 @@ Por defecto, una pasada prueba `head`, `iou`, `head_mh3`, `head_mh3_mot`, `iou_m
 ```bash
 sbatch slurm/trackheads_track.sbatch                       # $OUTPUT_ROOT/trackheads/trackheads_v3/track_default/{table.md,<config>.json}
 TAG=x TRACK_EXTRA="--configs a=head,min_hits=3,motion=1,null_bias=1 b=head,min_hits=3,motion=1,max_lost=60" sbatch slurm/trackheads_track.sbatch
+```
+
+## Detector descongelado (`train_joint.py`)
+Con el detector congelado, la asociación de la cabeza quedó al nivel de OC-SORT (AssA 34.5 frente a 31.9) pero lejos del módulo e2e H2
+descongelado (AssA 44.7, HOTA 58.6). El ajuste conjunto entrena a la vez TrackHeads y el detector (decoder, encoder y backbone salvo su
+primera capa, como RT-DETRv2 y como `tracking/e2e/train_joint.py`):
+- **Pérdida** = detección completa de RT-DETRv2 sobre los 2B frames del par + `--lambda-th` (10) · pérdida de TrackHeads. El gradiente de la
+  cabeza llega al detector por las queries y por los mapas del encoder de t+k; cajas y scores se desconectan.
+- **lr**: decoder `--lr-det` 2e-5, encoder igual, backbone /10, TrackHeads `--lr` 5e-5; warmup y coseno. Con `--init` (best.pth de v3) el
+  detector aprende desde el primer paso. BatchNorm fijos; decoder en train (denoising) y el resto en eval.
+- **Control**: DetA en val (1 de cada `--deta-stride` 4 frames, media de los umbrales 0.5/0.6/0.7) cada época. Si cae más de `--deta-tol`
+  0.5 respecto al inicial, la época no vale y se para (`--no-deta-stop` solo lo registra). `best.pth` = mejor `val_assoc_head` entre las
+  épocas válidas; `detector_best.pth` es el detector de esa época y `best.pth` lo apunta en `args.det_ckpt`, así que `diagnose.py` y
+  `track.py` lo cargan solos.
+- Memoria: `--batch` 4 pares = 8 frames con el detector completo en fp16. Si no cabe, `--batch 2` o `--no-train-backbone`.
+```bash
+sbatch slurm/trackheads_joint.sbatch       # entrena trackheads_v3_joint desde v3, diagnostica y evalúa el tracker (track_default/table.md)
 ```
 
 ## Entrenamiento

@@ -11,8 +11,9 @@
 # movimiento, umbrales; ver DEFAULT_CONFIGS en track.py) y añade ByteTrack y OC-SORT del baseline si existen.
 # Añadir --partition / --account según el clúster. Desde la raíz del repo (con mkdir -p logs):
 #   sbatch slurm/trackheads_track.sbatch                                   # usa $OUTPUT_ROOT/trackheads/trackheads_v3/best.pth
+#   TAG=emb PRESET=emb sbatch slurm/trackheads_track.sbatch                 # variantes de actualización del emb (last/clean/ema)
 #   TAG=nb1 TRACK_EXTRA="--configs a=head,min_hits=3,motion=1,null_bias=1 b=head,min_hits=3,motion=1,max_lost=60" sbatch slurm/trackheads_track.sbatch
-# Resultados en $OUTPUT_ROOT/trackheads/$RUN_NAME/track_$TAG/: <config>/<seq>.txt, <config>.json y table.md (también en el log).
+# Resultados en $OUTPUT_ROOT/trackheads/$RUN_NAME/track_$TAG/: <config>/<seq>.txt, <config>.json, table.md e idsw.json (tablas también en el log).
 set -euo pipefail
 module load GCC/12.2.0 CUDA/11.8.0
 eval "$(conda shell.bash hook)"
@@ -25,12 +26,12 @@ BASE="$OUTPUT_ROOT/${BASELINE_RUN:-baseline}"              # salida de slurm/bas
 VAL="$DANCETRACK_DIR/val"
 [ -f "$CKPT" ] || { echo "ERROR: no existe $CKPT" >&2; exit 1; }
 
-echo "== [1/3] tracking -> $OUT"
+echo "== [1/4] tracking -> $OUT"
 # shellcheck disable=SC2086
-python -m tracking.trackheads.track --ckpt "$CKPT" --out "$OUT" --root "$DANCETRACK_DIR" \
+python -m tracking.trackheads.track --ckpt "$CKPT" --out "$OUT" --root "$DANCETRACK_DIR" --preset "${PRESET:-lifecycle}" \
   --num-workers "${SLURM_CPUS_PER_TASK:-6}" ${TRACK_EXTRA:-}
 
-echo "== [2/3] TrackEval"
+echo "== [2/4] TrackEval"
 CFGS=$(cd "$OUT" && ls -d */ | sed 's#/$##')
 FIRST=$(echo "$CFGS" | head -n1)
 SEQS=$(cd "$OUT/$FIRST" && ls *.txt | sed 's/.txt$//')
@@ -45,5 +46,11 @@ for T in bytetrack ocsort; do
   [ -f "$BASE/$T.json" ] && ARGS+=("$T=$BASE/$T.json") || echo "(sin $BASE/$T.json: $T no entra en la tabla)"
 done
 
-echo "== [3/3] tabla"
+echo "== [3/4] tabla"
 python -m tracking.baseline.make_table "${ARGS[@]}" | tee "$OUT/table.md"
+
+echo "== [4/4] cambios de identidad (idsw.py)"
+IDSW=()
+for M in $CFGS; do IDSW+=("$M=$OUT/$M"); done
+for T in bytetrack ocsort; do [ -d "$BASE/$T" ] && IDSW+=("$T=$BASE/$T"); done
+python -m tracking.trackheads.idsw --gt-root "$VAL" "${IDSW[@]}" --out "$OUT/idsw.json"

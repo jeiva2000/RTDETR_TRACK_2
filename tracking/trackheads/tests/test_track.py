@@ -68,6 +68,28 @@ def test_motion():
     assert abs(tr.vel[0, 0].item() - 0.03) < 1e-5 and abs(tr.ref_box(10)[0, 0].item() - (0.22 + 0.06)) < 1e-5    # extrapola como mucho 2 frames
 
 
+def test_emb_update():
+    # dos personas: A fija en x=0.3; B se acerca y solapa con A en los frames 3-4. emb de A = +1, de B = -1; en el cruce, la detección
+    # de A trae un emb mezclado (0).
+    def frames(tr):
+        far, near = [0.8, 0.5, 0.1, 0.2], [0.33, 0.5, 0.1, 0.2]
+        A = [0.3, 0.5, 0.1, 0.2]
+        for f, (b, ea) in enumerate([(far, 1.), (far, 1.), (near, 0.), (near, 0.)], 1):
+            box = torch.tensor([A, b]); emb = torch.tensor([[ea] * 4, [-1.] * 4])
+            tr.step(f, emb, box, torch.tensor([0.9, 0.9]), None)
+        return tr.emb[tr.ids.index(1), 0].item()
+    assert frames(_tracker()) == 0.0                                                   # last: se contamina
+    assert frames(_tracker(emb_update='clean')) == 1.0                                 # clean: conserva la apariencia previa al cruce
+    assert abs(frames(_tracker(emb_update='ema', emb_ema=0.5)) - 0.25) < 1e-6          # 1 -> 1 -> 0.5 -> 0.25
+    assert frames(_tracker(emb_update='clean_ema', emb_ema=0.5)) == 1.0
+    try:
+        _tracker(emb_update='otro')
+        rejected = False
+    except AssertionError as e:
+        rejected = 'emb_update desconocido' in str(e)
+    assert rejected, 'debía rechazar un emb_update desconocido'
+
+
 class SeqStub(StubDetector):
     """Inferencia sin GT para una secuencia: devuelve las cajas GT (con ruido) del frame siguiente en cada imagen recibida."""
     def __init__(self, gt):

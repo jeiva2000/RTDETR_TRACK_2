@@ -20,6 +20,15 @@ Gestión del ciclo de vida (claves de cada configuración; por defecto, las opci
 - motion=1: velocidad constante del centro. La velocidad se estima con una media exponencial (motion_ema) de los desplazamientos entre
   asignaciones; la caja que se usa como prev_box (cabeza) o para el IoU es la última caja con el centro extrapolado
   min(frames sin ver, motion_max) frames. El tamaño no se extrapola.
+- emb_update: cómo se actualiza el emb del track al asignarle una detección (la caja siempre pasa a ser la de la detección).
+  * last: se reemplaza por el de la detección (la primera versión).
+  * ema: media exponencial, emb = emb_ema·emb + (1 − emb_ema)·emb_detección.
+  * clean: se reemplaza solo si la caja asignada no solapa (IoU < clean_iou) con ninguna otra candidata del frame. En un cruce, la
+    query de una caja que cubre a dos personas mezcla a ambas; así el track conserva la apariencia de antes del cruce.
+  * clean_ema: la media exponencial, solo con detecciones limpias.
+  La cabeza se entrenó con el emb de UNA detección; ema y clean_ema le dan una media de varias (cambio solo de inferencia).
+--preset elige el juego de configuraciones por defecto: lifecycle (las del ciclo de vida) o emb (las de emb_update sobre la mejor del
+ciclo de vida: min_hits=3, motion=1, out_thresh=0.5).
 Uso: python -m tracking.trackheads.track --ckpt <trackheads best.pth> --out <dir> [--configs ...]; luego tracking.baseline.evaluate
 sobre <dir>/<nombre>/. O todo junto con slurm/trackheads_track.sbatch."""
 import argparse, os, sys, time
@@ -55,8 +64,14 @@ def assign(score, null):
 
 
 CFG_KEYS = dict(min_hits=int, out_thresh=float, motion=int, motion_ema=float, motion_max=int, max_lost=int, null_bias=float, iou_min=float,
-                birth_thresh=float, birth_nms=float)
-DEFAULT_CONFIGS = ['head=head', 'iou=iou', 'head_mh3=head,min_hits=3', 'head_mh3_mot=head,min_hits=3,motion=1',
+                birth_thresh=float, birth_nms=float, emb_update=str, emb_ema=float, clean_iou=float)
+EMB_UPDATES = ('last', 'ema', 'clean', 'clean_ema')
+_BEST = 'head,min_hits=3,motion=1,out_thresh=0.5'
+PRESETS = {}
+PRESETS['emb'] = [f'head_last={_BEST}', f'head_clean={_BEST},emb_update=clean', f'head_ema09={_BEST},emb_update=ema,emb_ema=0.9',
+                  f'head_ema07={_BEST},emb_update=ema,emb_ema=0.7', f'head_clean_ema09={_BEST},emb_update=clean_ema,emb_ema=0.9',
+                  f'head_clean_b06={_BEST},emb_update=clean,birth_thresh=0.6']
+PRESETS['lifecycle'] = DEFAULT_CONFIGS = ['head=head', 'iou=iou', 'head_mh3=head,min_hits=3', 'head_mh3_mot=head,min_hits=3,motion=1',
                    'iou_mh3_mot=iou,min_hits=3,motion=1', 'head_mh3_mot_out05=head,min_hits=3,motion=1,out_thresh=0.5',
                    'head_mh3_mot_b06=head,min_hits=3,motion=1,birth_thresh=0.6']
 
@@ -71,6 +86,7 @@ def parse_config(spec, a):
         k, v = item.split('=', 1)
         assert k in CFG_KEYS, f'clave desconocida en {spec!r}: {k} (válidas: {", ".join(CFG_KEYS)})'
         setattr(c, k, CFG_KEYS[k](v))
+    assert c.emb_update in EMB_UPDATES, f'emb_update desconocido en {spec!r}: {c.emb_update} (válidos: {", ".join(EMB_UPDATES)})'
     return name, c
 
 
@@ -104,6 +120,18 @@ class Tracker:
         logp = out['assoc_logits'][0].float().log_softmax(-1)
         return logp[:, :-1], logp[:, -1] + self.a.null_bias
 
+    def update_emb(self, i, j, emb_c, box_c):
+        a = self.a
+        if a.emb_update in ('clean', 'clean_ema'):
+            iou = pair_iou(box_c[j:j + 1][None], box_c[None])[0, 0]
+            iou[j] = 0
+            if len(iou) and iou.max() >= a.clean_iou:
+                return                                      # caja solapada con otra candidata: se conserva la apariencia anterior
+        if a.emb_update in ('ema', 'clean_ema'):
+            self.emb[i] = a.emb_ema * self.emb[i] + (1 - a.emb_ema) * emb_c[j]
+        else:
+            self.emb[i] = emb_c[j]
+
     def _filter(self, keep):
         self.ids = [t for t, k in zip(self.ids, keep.tolist()) if k]
         for k in ('emb', 'box', 'last', 'vel', 'streak', 'hits', 'conf'):
@@ -128,7 +156,8 @@ class Tracker:
                 self.streak[i] = self.streak[i] + 1 if dt == 1 else 1
                 self.hits[i] += 1
                 self.conf[i] |= bool(self.streak[i] >= a.min_hits) or early
-                self.emb[i], self.box[i], self.last[i] = emb_c[j], box_c[j], frame
+                self.update_emb(i, j, emb_c, box_c)
+                self.box[i], self.last[i] = box_c[j], frame
                 if self.conf[i] and sc_c[j] >= a.out_thresh:
                     out.append((self.ids[i], j))
             # muerte: más de max_lost frames sin asignar; un track sin confirmar muere en cuanto falla un frame
@@ -184,6 +213,7 @@ def main(a, detector=None):
     device = torch.device(a.device if (a.device == 'cpu' or torch.cuda.is_available()) else 'cpu')
     ck = torch.load(a.ckpt, map_location='cpu')
     ta = argparse.Namespace(**ck['args'])
+    a.configs = a.configs or PRESETS[a.preset]
     a.cfgs = dict(parse_config(c, a) for c in a.configs)
     assert 'w_assoc' in ck['args'] or all(c.mode == 'iou' for c in a.cfgs.values()), \
         'el modo head necesita un checkpoint con Associator (trackheads_v3 o posterior)'
@@ -212,8 +242,12 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True, help='best.pth de TrackHeads (con Associator)')
     p.add_argument('--out', required=True, help='escribe <out>/<modo>/<seq>.txt')
-    p.add_argument('--configs', nargs='+', default=DEFAULT_CONFIGS,
-                   help='"nombre=modo[,clave=valor...]", modo head o iou; claves: ' + ', '.join(CFG_KEYS) + '. Por defecto: ' + ' '.join(DEFAULT_CONFIGS))
+    p.add_argument('--configs', nargs='+', default=None,
+                   help='"nombre=modo[,clave=valor...]", modo head o iou; claves: ' + ', '.join(CFG_KEYS) + '. Por defecto, las de --preset')
+    p.add_argument('--preset', choices=list(PRESETS), default='lifecycle', help='juego de configuraciones si no se da --configs')
+    p.add_argument('--emb-update', choices=EMB_UPDATES, default='last', help='actualización del emb del track al asignarle una detección')
+    p.add_argument('--emb-ema', type=float, default=0.9, help='[ema] peso del emb anterior')
+    p.add_argument('--clean-iou', type=float, default=0.3, help='[clean] IoU con otra candidata a partir del cual la detección no es limpia')
     p.add_argument('--det-ckpt', default=None, help='por defecto, el del entrenamiento')
     p.add_argument('--det-config', default=None)
     p.add_argument('--root', default=None, help='DanceTrack (usa val/); por defecto, el del entrenamiento')
