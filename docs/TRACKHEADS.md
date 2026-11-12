@@ -104,6 +104,18 @@ sbatch slurm/trackheads_track.sbatch                       # $OUTPUT_ROOT/trackh
 TAG=x TRACK_EXTRA="--configs a=head,min_hits=3,motion=1,null_bias=1 b=head,min_hits=3,motion=1,max_lost=60" sbatch slurm/trackheads_track.sbatch
 ```
 
+**Cambios de identidad** (`idsw.py`, lo lanza el sbatch al final): clasifica cada IDSW (emparejamiento tipo CLEAR a IoU 0.5) en
+renacimiento (id nuevo) o robo (otro track ya existente se queda con la persona), por tramo de hueco, y si ocurre en un cruce. Sobre
+`head_mh3_mot_out05` (3783 IDSW) el 84 % son robos y la mitad del total son robos **sin hueco** en un cruce (~1920, frente a ~410 de
+OC-SORT y ~950 de ByteTrack): la cabeza pierde la identidad frame a frame frente al vecino, no en huecos largos (>30 frames, ~3 %).
+
+**Actualización del `emb` del track** (`emb_update`: `last` por defecto, `ema` con `emb_ema` 0.9, `clean` = no actualizar cuando la
+caja solapa con otra candidata más de `clean_iou` 0.3, `clean_ema`; `--preset emb` prueba las variantes). Resultado en v3: la
+hipótesis de que el `emb` se contamina en el cruce **no se sostiene**. `clean` sube los robos sin hueco un 40 % (~2670) y los
+intercambios temporales ("vuelve a q" del 40 al 50 %): la cabeza se entrenó con el `emb` de k ≤ 10 frames antes y uno guardado antes
+del cruce es demasiado viejo. `ema` 0.7 baja el total un 4 % (3616) sin tocar los robos sin hueco. Lo que falla es la capacidad del
+`emb` del detector congelado para distinguir vecinos (apariencia sola: 0.49 en val), de ahí el detector descongelado.
+
 ## Detector descongelado (`train_joint.py`)
 Con el detector congelado, la asociación de la cabeza quedó al nivel de OC-SORT (AssA 34.5 frente a 31.9) pero lejos del módulo e2e H2
 descongelado (AssA 44.7, HOTA 58.6). El ajuste conjunto entrena a la vez TrackHeads y el detector (decoder, encoder y backbone salvo su
@@ -120,6 +132,33 @@ primera capa, como RT-DETRv2 y como `tracking/e2e/train_joint.py`):
 ```bash
 sbatch slurm/trackheads_joint.sbatch       # entrena trackheads_v3_joint desde v3, diagnostica y evalúa el tracker (track_default/table.md)
 ```
+
+**Primer intento (λ=10, detector completo, A30: 0.35 s/paso, ~12 min por época de 2000 pasos + DetA):** parada en la primera época.
+DetA 79.10 → 77.34 (tolerancia 0.5), sin ninguna época válida. La asociación subió (cabeza 0.9266 → 0.9393, cruces 0.8823 → 0.8962,
+apariencia sola 0.49 → 0.60, recall de "ninguna" 0.06 → 0.28), pero el prev_box subió casi lo mismo (0.8736 → 0.8899, cruces
+0.793 → 0.812): la ganancia de la cabeza **sobre su línea base no cambió** (+0.05 global, +0.08 en cruces). Es decir, la subida viene de
+que el detector cambió sus candidatas (menos confusoras y menos recall, que es lo que baja el DetA), no de que la cabeza asocie mejor.
+Con λ=10 el término de TrackHeads (≈ 8.8) pesa más que el de detección (≈ 7.5) y la pérdida de atención baja de 0.78 a ~0.2 en 2000
+pasos: el gradiente directo sobre los mapas del encoder reorganiza las características rápido.
+
+**Segundo intento (λ=1):** detector completo (`trackheads_v3_joint_l1`) y solo decoder (`trackheads_v3_joint_dec`, encoder y
+backbone congelados: solo cambia el `emb`). Ganancia de la cabeza sobre prev_box (global / cruces), que es lo que no depende del
+conjunto de candidatas:
+
+| | DetA | global | cruces | apariencia sola |
+|---|---|---|---|---|
+| v3 (congelado) | 79.10 | +0.053 | +0.089 | 0.49 |
+| λ=1 completo, ep 0 (best) | 78.71 | +0.061 | +0.098 | 0.62 |
+| λ=1 completo, ep 2 (para: DetA 78.24) | 78.24 | +0.058 | +0.089 | 0.62 |
+| λ=1 solo decoder, ep 0 (best) | 79.16 | +0.054 | +0.090 | 0.59 |
+| λ=1 solo decoder, ep 5 (para: 5 sin mejorar) | 78.91 | +0.048 | +0.082 | 0.62 |
+
+El `emb` sí se vuelve más discriminativo (apariencia sola 0.49 → 0.62), pero sigue muy por debajo del IoU (0.88) y la cabeza no lo
+aprovecha: los pesos del Associator no se mueven (escala 10.0 → 10.3, IoU 5.2) y la ganancia en cruces queda en +0.09 ± 0.01. En
+las tres tiradas el mejor val es la época 0 y luego se estanca mientras la pérdida de TrackHeads en train baja de 0.94 a 0.52: la
+cabeza sobreajusta los pares de train, no le falta señal del detector. Conclusión: el techo (~0.94 por pares, ~0.90 en cruces) es de
+la formulación por pares (prev_box + `emb` de un frame), no del detector congelado. Lo que lo distingue de H2 (AssA 44.7) es el
+historial y el entrenamiento sobre clips.
 
 ## Entrenamiento
 ```bash

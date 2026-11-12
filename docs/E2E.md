@@ -71,6 +71,26 @@ python -m tracking.e2e.train --train-cache ... --val-cache ... --out ... -u moti
 **Solo verificado con datos sintéticos en CPU** (el test de entrenamiento comprueba que el predictor aprende un movimiento de velocidad constante); la evaluación real está pendiente.
 Limitaciones: la cámara se mueve poco en DanceTrack, así que el movimiento relativo a la caja es suficiente; no hay compensación de movimiento de cámara. La predicción es de un solo paso (con `gap` como entrada), sin multimodalidad.
 
+### Intercambio de IDs en el entrenamiento (`train.p_swap`, H1/H2; `tracking/e2e/augment.py`)
+Adaptación de los *Spatial ID Switches* de MOTIP2, el aumento que más pesa en su ablación sobre DanceTrack val (sin él, AssA 56.5 → 49.7).
+En MOTIP2 se intercambian las etiquetas de ID de objetos cercanos en el historial y el objetivo actual sigue siendo la identidad verdadera.
+En H1/H2 el historial es el estado recurrente del track, así que lo que se corrompe es la **actualización**:
+- En cada frame de entrenamiento, cada track vivo con match entra con probabilidad `train.p_swap`. Entre los elegidos (al menos 2) se
+  permutan sus detecciones sin puntos fijos, con un Hungarian sobre GIoU + ruido N(0, `train.swap_sigma`²) (0.5, como MOTIP2): los
+  intercambios caen sobre todo entre vecinos.
+- El track alterado mete la apariencia del vecino en su EMA, salta a su caja y su GRU observa el salto, pero `state.ids` no cambia: en los
+  frames siguientes el objetivo sigue siendo su persona. Es el estado que deja un robo de identidad del propio tracker, y el modelo aprende
+  a volver en lugar de quedarse con el vecino.
+- La NLL de movimiento ignora el track hasta su siguiente match limpio (su caja es la del vecino). La pérdida de asociación no cambia.
+- Se aplica después de la decisión (con o sin scheduled sampling), también en el ajuste conjunto descongelado (comparte `run_batch`). En
+  evaluación e inferencia no hace nada. El log del descongelado registra `swap`, la fracción de actualizaciones alteradas.
+- Variantes: `h2_swap` (`p_swap` 0.1) y `h2_swap02` (0.2). Con ~9 tracks por frame, 0.1 altera ~6 % de las actualizaciones. El valor
+  no está ajustado. El H3 tiene su propio bucle y no lo usa.
+```bash
+# entrena y evalúa solo h2_swap con el mismo detector y receta que H2; la tabla incluye las variantes ya evaluadas
+E2E_RUN_VARIANTS=h2_swap E2E_TABLE_VARIANTS="h1 h2 h3 h2_swap" sbatch --export=ALL slurm/e2e.slurm
+```
+
 ## Hito H3: asociación relacional (`tracking/e2e/h3/`, `h3.enabled=true`)
 Módulo alternativo que **sustituye** al `E2EModel` (H1/H2) con la misma tubería (clips, caché, entrenamiento congelado y descongelado con DDP, inferencia, barrido de umbrales, evaluación): `build_model(cfg)` elige el modelo.
 Combina tres señales (apariencia, movimiento y **relaciones espaciales entre objetos**) con gates aprendidos por par detección–track. Con `h3.enabled=false` (por defecto) nada cambia para H1/H2.

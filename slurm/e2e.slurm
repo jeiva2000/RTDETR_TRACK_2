@@ -57,6 +57,7 @@ DET_CKPT_EXTERNAL="${DET_CKPT_EXTERNAL:-}"              # ruta a un best.pth de 
 # --- Etapa 2: entrenamiento descongelado del módulo e2e (DDP) ---
 E2E_RUN_VARIANTS="${E2E_RUN_VARIANTS:-${E2E_VARIANT:-h1 h2 h3}}"   # variantes de tracking/configs/e2e_variants.sh que se entrenan, EN ESTE ORDEN y una tras otra (h1 = solo apariencia; h2 = + GRU de movimiento; h3 = asociación relacional). E2E_VARIANT=<una> sigue valiendo para una sola
 E2E_RUN_PREFIX="${E2E_RUN_PREFIX:-e2e_unfrozen}"        # carpeta de cada variante en $OUTPUT_ROOT: <prefijo>_<variante>
+E2E_TABLE_VARIANTS="${E2E_TABLE_VARIANTS:-$E2E_RUN_VARIANTS}"   # variantes (ya evaluadas o de este trabajo) que entran en la tabla comparativa; p. ej. "h1 h2 h3 h2_swap" al entrenar solo h2_swap
 FORCE_E2E="${FORCE_E2E:-0}"                             # 1 = reentrenar también las variantes que ya terminaron (marcador TRAINING_DONE)
 E2E_TRAIN_REV="${E2E_TRAIN_REV:-2}"                     # versión de la receta de entrenamiento e2e: 1 = solo decoder; 2 = detector completo (backbone + encoder + decoder). Súbela si cambia la receta: las variantes entrenadas con otra se reentrenan solas
 RUN_EVAL="${RUN_EVAL:-1}"                               # 1 = tras entrenar, evaluar cada variante (etapa 3); 0 = solo entrenar
@@ -358,7 +359,7 @@ PYEOF
 }
 comparison_table() {
   local ARGS=() V EV T F N TABLE="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_comparacion.md"
-  for V in $E2E_RUN_VARIANTS; do
+  for V in $E2E_TABLE_VARIANTS; do
     EV="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V/eval"
     [ -f "$EV/seed_run/eval.json" ] || continue
     ARGS+=("${V}_e2e=$EV/seed_run/eval.json")
@@ -371,7 +372,7 @@ comparison_table() {
   [ "${#ARGS[@]}" -gt 0 ] || { echo "[etapa 3] no hay evaluaciones que tabular"; return 1; }
   { python -m tracking.baseline.make_table "${ARGS[@]}"
     echo; echo "Configuración de inferencia elegida para el módulo e2e (barrido sobre val; una semilla por variante):"
-    for V in $E2E_RUN_VARIANTS; do
+    for V in $E2E_TABLE_VARIANTS; do
       F="$OUTPUT_ROOT/${E2E_RUN_PREFIX}_$V/eval/seed_run/best_infer.json"
       [ -f "$F" ] && echo "- $V: $(cat "$F")"
     done; } | tee "$TABLE"

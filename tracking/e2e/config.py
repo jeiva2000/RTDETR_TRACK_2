@@ -13,7 +13,8 @@ DEFAULTS = {
     'loss': {'w_assoc': 1.0, 'w_birth': 1.0, 'w_motion': 1.0, 'birth_pos_weight': 1.0, 'birth_detach': True},   # birth_detach: el gradiente del nacimiento no llega a la proyección compartida
     'train': {'T': 10, 'burn_in': 0, 'ss_max': 0.5, 'ss_warmup': 5, 'p_fn': 0.1, 'lr': 1e-3, 'weight_decay': 1e-4,
               'epochs': 20, 'deta_stop': True, 'batch': 8, 'samples_per_epoch': 2000, 'val_samples': 300, 'clip_grad': 1.0,
-              'max_stride': 3, 'p_skip': 0.2, 'max_skip': 5},
+              'max_stride': 3, 'p_skip': 0.2, 'max_skip': 5,
+              'p_swap': 0.0, 'swap_sigma': 0.5},   # intercambio de IDs (H1/H2, tracking/e2e/augment.py): prob. por track con match y frame; ruido sobre la GIoU
     'infer': {'birth_mode': 'head', 'birth_thr': 0.5, 'birth_nms': 0.7, 'min_score': 0.0},   # birth_mode: head | score
     'h3': {                                                          # H3: asociación relacional (tracking/e2e/h3/); h3.enabled=true lo activa en lugar de E2EModel
         'enabled': False,

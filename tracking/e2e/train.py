@@ -3,12 +3,15 @@ comparación sea limpia: clips de T frames con stride y saltos aleatorios (clips
 falsos negativos inyectados y muerte tras max_age. Diferencias: estado en tensores con padding + máscaras (lote de clips en paralelo) y
 cabeza de nacimiento con BCE aparte (D1).
 H2 (motion.mode=gru): se añade la NLL gaussiana del movimiento (loss.w_motion) sobre los tracks presentes.
+Intercambio de IDs (train.p_swap > 0, H1/H2): en entrenamiento, algunos tracks con match se actualizan con la detección de un vecino
+(tracking/e2e/augment.py); el objetivo sigue siendo su persona. La NLL de movimiento ignora esos tracks hasta su siguiente match limpio.
 Uso: python -m tracking.e2e.train --cfg tracking/configs/e2e.yml --train-cache <dir> --val-cache <dir> --out <dir> [-u train.lr=1e-3 ...]"""
 import argparse, json, os, random, sys, time
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from tracking.e2e.augment import id_switch
 from tracking.e2e.config import load_config
 from tracking.e2e.losses import IGNORE, assoc_loss, birth_loss
 from tracking.e2e.model import build_model
@@ -34,7 +37,9 @@ def run_batch(model, batch, cfg, device, train, ss):
     W = cfg.train.burn_in
     state = model.new_state(B, device)
     sa, na, sb, nb, sm, nm = 0.0, 0, 0.0, 0, 0.0, 0
-    st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0)
+    st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, swapped=0, n_matched=0)
+    p_swap, swap_sigma = float(cfg.train.get('p_swap', 0.0)), float(cfg.train.get('swap_sigma', 0.5))
+    tainted = torch.zeros_like(state.alive)   # estado actualizado con la detección de otro (intercambio) y aún sin match limpio
     for t in range(T):
         frame = frames[:, t]
         dets = from_cache(emb[:, t], boxes[:, t], scores[:, t])
@@ -55,7 +60,7 @@ def run_batch(model, batch, cfg, device, train, ss):
             la, n_a = assoc_loss(logits, tgt_l)
             sa, na = sa + la, na + int(n_a)
             if pred is not None:   # NLL del movimiento sobre los tracks cuya detección está presente (estado previo a la actualización)
-                pres_m = alive & (target < K)
+                pres_m = alive & (target < K) & ~tainted      # tras un intercambio la caja del estado es la del vecino
                 obox = torch.gather(dets.box, 1, target.clamp(max=K - 1)[..., None].expand(-1, -1, 4))
                 lm, n_m = motion_loss(pred[0], pred[1], box_delta(state.box, obox), pres_m)
                 sm, nm = sm + lm, nm + int(n_m)
@@ -69,9 +74,15 @@ def run_batch(model, batch, cfg, device, train, ss):
                     ids_c = torch.tensor(sorted({i for p in cr[t] for i in p}), device=device)
                     m = alive[b] & torch.isin(state.ids[b], ids_c)
                     st['cross'] += int(m.sum()); st['ok_cross'] += int((ok[b] & m).sum())
+        swapped = torch.zeros_like(alive)
+        if train and p_swap > 0:            # intercambio de IDs: corrompe la actualización, no el objetivo (state.ids no cambia)
+            assign, swapped = id_switch(assign, alive, dets.box, p_swap, swap_sigma)
+            st['swapped'] += int(swapped.sum()); st['n_matched'] += int((alive & (assign < K)).sum())
         with torch.no_grad() if bi else torch.enable_grad():
-            state, _ = model.update(state, assign, dets, enc, frame)
+            state, matched = model.update(state, assign, dets, enc, frame)
+            tainted = (tainted & ~matched) | swapped
             state = state.kill(frame, cfg.state.max_age)
+            tainted = tainted & state.alive
             known = state.ids
             new = (tid_t >= 0) & dets.valid & ~((tid_t[:, :, None] == known[:, None, :]).any(-1))   # IDs GT sin track
             if not bi:
@@ -85,7 +96,8 @@ def run_batch(model, batch, cfg, device, train, ss):
     loss = cfg.loss.w_assoc * sa / max(na, 1) + cfg.loss.w_birth * sb / max(nb, 1) + cfg.loss.w_motion * sm / max(nm, 1)
     f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)
     st.update(assoc_sum=f(sa), birth_sum=f(sb), n_birth=nb, motion_sum=f(sm), n_motion=nm)
-    st['parts'] = dict(assoc=f(sa) / max(na, 1), birth=f(sb) / max(nb, 1), **({'motion': f(sm) / max(nm, 1)} if model.motion is not None else {}))   # partes de la pérdida, sin ponderar
+    st['parts'] = dict(assoc=f(sa) / max(na, 1), birth=f(sb) / max(nb, 1), **({'motion': f(sm) / max(nm, 1)} if model.motion is not None else {}),
+                       **({'swap': st['swapped'] / max(st['n_matched'], 1)} if p_swap > 0 and train else {}))   # partes de la pérdida, sin ponderar
     return loss, st
 
 

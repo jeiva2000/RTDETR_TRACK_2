@@ -200,6 +200,53 @@ def test_smoke_train_and_infer_with_motion():
         assert len(rows) > 0 and len(ids) >= 1, 'con nacimiento por score debe producir tracks (recorre el GRU y la afinidad con movimiento)'
 
 
+
+def test_id_switch():
+    """Intercambio de IDs: solo tracks vivos con match, permutación sin puntos fijos de sus detecciones, preferencia por vecinos."""
+    from tracking.e2e.augment import id_switch
+    K = 4
+    box = torch.tensor([[[0.20, 0.5, 0.1, 0.3], [0.23, 0.5, 0.1, 0.3], [0.80, 0.5, 0.1, 0.3], [0.83, 0.5, 0.1, 0.3]]])
+    alive = torch.tensor([[True, True, True, False]])
+    assign = torch.tensor([[0, 1, K, 2]])
+    out, sw = id_switch(assign, alive, box, 0.0)
+    assert torch.equal(out, assign) and not sw.any()
+    out, sw = id_switch(assign, alive, box, 1.0)
+    assert out.tolist() == [[1, 0, K, 2]] and sw.tolist() == [[True, True, False, False]], (out, sw)    # sin match y muerto: intactos
+    # 4 tracks en dos parejas de vecinos: sin ruido, cada uno recibe la detección de su vecino
+    g = torch.Generator().manual_seed(0)
+    out, sw = id_switch(torch.tensor([[0, 1, 2, 3]]), torch.ones(1, 4, dtype=torch.bool), box, 1.0, sigma=0.0, generator=g)
+    assert out.tolist() == [[1, 0, 3, 2]] and sw.all()
+    # con ruido: siempre una permutación de las mismas detecciones sin puntos fijos
+    for seed in range(20):
+        g = torch.Generator().manual_seed(seed)
+        out, _ = id_switch(torch.tensor([[0, 1, 2, 3]]), torch.ones(1, 4, dtype=torch.bool), box, 1.0, sigma=0.5, generator=g)
+        assert sorted(out[0].tolist()) == [0, 1, 2, 3] and all(out[0, i] != i for i in range(4))
+
+
+def test_run_batch_with_id_switch():
+    """run_batch con train.p_swap: pérdida finita y con gradiente, intercambios registrados solo en entrenamiento; con p_swap=0 nada cambia."""
+    from tracking.e2e.train import run_batch
+    B, T, K, P = 2, 6, 6, 4
+    g = torch.Generator().manual_seed(0)
+    base = torch.rand(B, 1, P, 4, generator=g) * 0.1 + torch.tensor([0.3, 0.3, 0.1, 0.2])
+    base[..., 0] += torch.arange(P) * 0.04                                       # personas cercanas: cruces frecuentes
+    boxes = torch.cat([base.expand(B, T, P, 4) + 0.01 * torch.randn(B, T, P, 4, generator=g), torch.rand(B, T, K - P, 4, generator=g) * 0.1 + 0.6], 2)
+    tid = torch.cat([torch.arange(P).expand(B, T, P), -torch.ones(B, T, K - P, dtype=torch.long)], 2)
+    batch = dict(emb=torch.randn(B, T, K, D, generator=g), boxes=boxes, scores=torch.rand(B, T, K, generator=g), tid=tid,
+                 frames=torch.arange(1, T + 1).expand(B, T), cross=[None] * B)
+    m = _model(train={'p_swap': 1.0, 'p_fn': 0.0}).train()
+    torch.manual_seed(0)
+    loss, st = run_batch(m, batch, m.cfg, 'cpu', True, 0.0)
+    assert torch.isfinite(loss) and st['swapped'] > 0 and 0 < st['parts']['swap'] <= 1, st
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.parameters())
+    _, st_eval = run_batch(m.eval(), batch, m.cfg, 'cpu', False, 1.0)
+    assert st_eval['swapped'] == 0 and 'swap' not in st_eval['parts'], 'en evaluación no hay intercambios'
+    m0 = _model(train={'p_swap': 0.0, 'p_fn': 0.0}).train()
+    torch.manual_seed(0); l0, s0 = run_batch(m0, batch, m0.cfg, 'cpu', True, 0.0)
+    torch.manual_seed(0); l1, _ = run_batch(m0, batch, m0.cfg, 'cpu', True, 0.0)
+    assert s0['swapped'] == 0 and torch.allclose(l0, l1) and 'swap' not in s0['parts']
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     for t in tests:

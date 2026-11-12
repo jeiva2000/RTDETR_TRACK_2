@@ -155,8 +155,8 @@ def main(a):
         d0 = deta()
         v0 = evaluate(jd, model, dl_va, a, device); det.set_train(True)
         f0 = lambda x: 'n/a' if x is None else f'{x:.4f}'
-        print(f'inicial: DetA {control_value(d0):.2f} por umbral {d0.get("DetA_by_thr")} | val asociación cabeza {f0(v0["assoc_head"])} '
-              f'(prev_box {f0(v0["assoc_prev"])}) cruces {f0(v0["cross_head"])}', flush=True)
+        print(f'inicial: DetA {control_value(d0):.2f} por umbral {d0.get("DetA_by_thr")} ({d0.get("n_det", "?")} detecciones) '
+              f'| val asociación cabeza {f0(v0["assoc_head"])} (prev_box {f0(v0["assoc_prev"])}) cruces {f0(v0["cross_head"])}', flush=True)
     c0 = control_value(d0)
     log = open(os.path.join(a.out, 'log.txt'), 'a')
     stopped = None
@@ -186,7 +186,7 @@ def main(a):
         d = deta()
         cv = control_value(d)
         ok = cv >= c0 - a.deta_tol
-        rec.update(DetA=d['DetA'], DetA_control=cv, DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), deta_ok=ok)
+        rec.update(DetA=d['DetA'], DetA_control=cv, DetA_control_init=c0, DetA_by_thr=d.get('DetA_by_thr'), n_det=d.get('n_det'), deta_ok=ok)
         v = evaluate(jd, model, dl_va, a, device); det.set_train(True)
         rec.update({f'val_{k}': val for k, val in v.items()})
         score = rec[SELECT['head']]
@@ -202,7 +202,7 @@ def main(a):
         log.write(json.dumps(rec) + '\n'); log.flush()
         fmt = lambda x: 'n/a' if x is None else f'{x:.4f}'
         w = model.assoc
-        print(f"ep {ep} | DetA {cv:.2f} (inicial {c0:.2f}{'' if ok else ', CAE'}) | val asociación cabeza {fmt(v['assoc_head'])} (prev_box {fmt(v['assoc_prev'])}, "
+        print(f"ep {ep} | DetA {cv:.2f} (inicial {c0:.2f}{'' if ok else ', CAE'}; {d.get('n_det', '?')} det) | val asociación cabeza {fmt(v['assoc_head'])} (prev_box {fmt(v['assoc_prev'])}, "
               f"apariencia {fmt(v['assoc_app'])}) cruces {fmt(v['cross_head'])} (prev_box {fmt(v['cross_prev'])}) ninguna recall {fmt(v['null_recall'])} "
               f"| pesos esc_apar {w.log_app.exp().item():.2f} masa {w.w_mass.item():.2f} iou {w.w_iou.item():.2f} "
               f"| train det {rec['train_det']:.3f} th {rec['train_th']:.3f} | {rec['time']}s{' *' if improved else ''}", flush=True)

@@ -14,6 +14,8 @@
 #   sbatch slurm/trackheads_joint.sbatch                                  # INIT = trackheads_v3/best.pth, RUN_NAME = trackheads_v3_joint
 #   INIT=... RUN_NAME=th_joint_b2 EXTRA="--batch 2" sbatch slurm/trackheads_joint.sbatch     # si la GPU se queda sin memoria
 #   EXTRA="--no-train-backbone" ...                                       # ablación: solo decoder + encoder (menos memoria y tiempo)
+#   RUN_NAME=trackheads_v3_joint_l1 EXTRA="--lambda-th 1" ...             # con λ=10 el DetA cayó 1.8 puntos en la primera época (ver docs)
+#   RUN_NAME=trackheads_v3_joint_dec EXTRA="--lambda-th 1 --no-train-encoder --no-train-backbone" ...   # solo decoder: solo cambia el emb
 # Si se corta por tiempo, relanzar con el mismo RUN_NAME: reanuda desde last.pth (--resume).
 set -euo pipefail
 module load GCC/12.2.0 CUDA/11.8.0
