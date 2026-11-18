@@ -87,9 +87,18 @@ En H1/H2 el historial es el estado recurrente del track, así que lo que se corr
 - Variantes: `h2_swap` (`p_swap` 0.1) y `h2_swap02` (0.2). Con ~9 tracks por frame, 0.1 altera ~6 % de las actualizaciones. El valor
   no está ajustado. El H3 tiene su propio bucle y no lo usa.
 ```bash
-# entrena y evalúa solo h2_swap con el mismo detector y receta que H2; la tabla incluye las variantes ya evaluadas
-E2E_RUN_VARIANTS=h2_swap E2E_TABLE_VARIANTS="h1 h2 h3 h2_swap" sbatch --export=ALL slurm/e2e.slurm
+# entrena y evalúa solo h2_swapapp con el mismo detector y receta que H2; la tabla incluye las variantes ya evaluadas.
+# --export solo con las variables (sin ALL): con --export=ALL el trabajo hereda el entorno del login y falla al cargar los módulos (nvcc)
+sbatch --export='E2E_RUN_VARIANTS=h2_swapapp,E2E_TABLE_VARIANTS=h1 h2 h3 h2_swap h2_swapapp' slurm/e2e.slurm
 ```
+**Resultado de `h2_swap`** (val, una semilla, global): HOTA 48.8, AssA 31.6, IDF1 46.2, IDSW 3675, frente a H2 con 58.6, 44.7, 59.9 y 2001.
+El DetA apenas cambia (75.7 frente a 77.2), y OC-SORT y ByteTrack dan lo mismo sobre su detector: lo que empeora es la asociación.
+Hipótesis: en MOTIP2 un intercambio es un token equivocado entre ~30 del historial, mientras que aquí sustituye la caja entera del estado
+(la mejor señal) y el GRU registra un salto falso. Además, con `swap` entre 0.04 y 0.17 por frame, cerca de la mitad de los tracks de un
+clip de 10 frames se corrompen alguna vez, muy lejos de la tasa de robos del tracker en inferencia (~1 %).
+- **`train.swap_mode=app`** (variante `h2_swapapp`, `p_swap` 0.05): el vecino solo entra en la EMA de apariencia (`model.update(...,
+  app_assign=...)`); la caja y el GRU se actualizan con la detección propia y la NLL de movimiento no ignora esos tracks. Es el robo que
+  deja un cruce en la apariencia, sin tocar la geometría. `swap_mode=all` (por defecto) es el comportamiento de `h2_swap`.
 
 ## Hito H3: asociación relacional (`tracking/e2e/h3/`, `h3.enabled=true`)
 Módulo alternativo que **sustituye** al `E2EModel` (H1/H2) con la misma tubería (clips, caché, entrenamiento congelado y descongelado con DDP, inferencia, barrido de umbrales, evaluación): `build_model(cfg)` elige el modelo.

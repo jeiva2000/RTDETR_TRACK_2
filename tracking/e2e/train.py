@@ -5,6 +5,7 @@ cabeza de nacimiento con BCE aparte (D1).
 H2 (motion.mode=gru): se añade la NLL gaussiana del movimiento (loss.w_motion) sobre los tracks presentes.
 Intercambio de IDs (train.p_swap > 0, H1/H2): en entrenamiento, algunos tracks con match se actualizan con la detección de un vecino
 (tracking/e2e/augment.py); el objetivo sigue siendo su persona. La NLL de movimiento ignora esos tracks hasta su siguiente match limpio.
+Con train.swap_mode=app solo la apariencia viene del vecino; la caja y el GRU se actualizan con la detección propia.
 Uso: python -m tracking.e2e.train --cfg tracking/configs/e2e.yml --train-cache <dir> --val-cache <dir> --out <dir> [-u train.lr=1e-3 ...]"""
 import argparse, json, os, random, sys, time
 import numpy as np
@@ -39,6 +40,9 @@ def run_batch(model, batch, cfg, device, train, ss):
     sa, na, sb, nb, sm, nm = 0.0, 0, 0.0, 0, 0.0, 0
     st = dict(n=0, ok=0, present=0, ok_present=0, ok_cross=0, cross=0, overflow=0, swapped=0, n_matched=0)
     p_swap, swap_sigma = float(cfg.train.get('p_swap', 0.0)), float(cfg.train.get('swap_sigma', 0.5))
+    swap_mode = str(cfg.train.get('swap_mode', 'all'))   # all: apariencia + caja + GRU del vecino; app: solo la apariencia (la caja y el GRU siguen limpios)
+    if swap_mode not in ('all', 'app'):
+        raise ValueError(f"train.swap_mode debe ser 'all' o 'app', no {swap_mode!r}")
     tainted = torch.zeros_like(state.alive)   # estado actualizado con la detección de otro (intercambio) y aún sin match limpio
     for t in range(T):
         frame = frames[:, t]
@@ -74,13 +78,17 @@ def run_batch(model, batch, cfg, device, train, ss):
                     ids_c = torch.tensor(sorted({i for p in cr[t] for i in p}), device=device)
                     m = alive[b] & torch.isin(state.ids[b], ids_c)
                     st['cross'] += int(m.sum()); st['ok_cross'] += int((ok[b] & m).sum())
-        swapped = torch.zeros_like(alive)
+        swapped, app_assign = torch.zeros_like(alive), None
         if train and p_swap > 0:            # intercambio de IDs: corrompe la actualización, no el objetivo (state.ids no cambia)
-            assign, swapped = id_switch(assign, alive, dets.box, p_swap, swap_sigma)
+            alt, swapped = id_switch(assign, alive, dets.box, p_swap, swap_sigma)
+            if swap_mode == 'app':
+                app_assign = alt            # solo la apariencia viene del vecino: caja y GRU limpios, la NLL de movimiento no se ignora
+            else:
+                assign = alt
             st['swapped'] += int(swapped.sum()); st['n_matched'] += int((alive & (assign < K)).sum())
         with torch.no_grad() if bi else torch.enable_grad():
-            state, matched = model.update(state, assign, dets, enc, frame)
-            tainted = (tainted & ~matched) | swapped
+            state, matched = model.update(state, assign, dets, enc, frame, app_assign=app_assign)
+            tainted = (tainted & ~matched) | (swapped if swap_mode == 'all' else torch.zeros_like(swapped))
             state = state.kill(frame, cfg.state.max_age)
             tainted = tainted & state.alive
             known = state.ids

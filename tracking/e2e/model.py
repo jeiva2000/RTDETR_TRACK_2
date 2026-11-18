@@ -82,12 +82,15 @@ class E2EModel(nn.Module):
             out[b, rows] = torch.where(idx >= 0, idx, torch.full_like(idx, K)).to(out.device)
         return out
 
-    def update(self, state, assign, dets, enc, frame):
-        """EMA de la apariencia, GRU de movimiento (H2) y actualización de caja/último frame, solo para los tracks con match (assign < K)."""
+    def update(self, state, assign, dets, enc, frame, app_assign=None):
+        """EMA de la apariencia, GRU de movimiento (H2) y actualización de caja/último frame, solo para los tracks con match (assign < K).
+        app_assign (opcional, misma forma y mismos tracks con match que assign): detección de la que se toma la APARIENCIA; la caja y el GRU
+        siguen usando assign. Lo usa el intercambio de IDs solo de apariencia (train.swap_mode=app)."""
         K = dets.emb.shape[1]
         matched = (assign < K) & state.alive
         j = assign.clamp(max=K - 1)
-        enc_obs = torch.gather(enc, 1, j[..., None].expand(-1, -1, enc.shape[-1]))
+        j_app = j if app_assign is None else app_assign.clamp(max=K - 1)
+        enc_obs = torch.gather(enc, 1, j_app[..., None].expand(-1, -1, enc.shape[-1]))
         box_obs = torch.gather(dets.box, 1, j[..., None].expand(-1, -1, 4))
         a = torch.where(matched[..., None], (1 - self.alpha) * state.a + self.alpha * enc_obs, state.a)
         box = torch.where(matched[..., None], box_obs, state.box)

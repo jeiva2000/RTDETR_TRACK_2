@@ -14,6 +14,7 @@ E2E_VARIANTS=(
   "h2_m64|motion.mode=gru motion.dim=64 motion.hidden=64"   # H2 con un vector de movimiento más pequeño
   "h2_swap|motion.mode=gru train.p_swap=0.1"    # H2 + intercambio de IDs entre vecinos (Spatial ID Switches de MOTIP2, tracking/e2e/augment.py)
   "h2_swap02|motion.mode=gru train.p_swap=0.2"  # H2 + intercambio de IDs más frecuente
+  "h2_swapapp|motion.mode=gru train.p_swap=0.05 train.swap_mode=app"   # H2 + intercambio SOLO de apariencia (EMA del vecino; caja y GRU limpios), menos frecuente
   "h3|$H3_TRAIN"                                                              # H3: asociación relacional (apariencia + movimiento + relaciones espaciales, gates por par), clips de 8 frames, con bucle cerrado en el entrenamiento
   "h3_gtonly|h3.enabled=true train.T=8 h3.closed_loop=false"                  # H3 con la receta anterior (nacimientos GT, scheduled sampling por frame, parada por DetA): para comparar
   "h3_nobirth|h3.enabled=true train.T=8 train.ss_max=0.9 train.ss_warmup=20 train.deta_stop=false h3.birth.enabled=false"   # H3 con la regla por score en lugar de la cabeza de nacimiento: para comparar

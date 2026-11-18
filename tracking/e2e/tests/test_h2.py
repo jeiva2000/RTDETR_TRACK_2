@@ -247,6 +247,48 @@ def test_run_batch_with_id_switch():
     torch.manual_seed(0); l1, _ = run_batch(m0, batch, m0.cfg, 'cpu', True, 0.0)
     assert s0['swapped'] == 0 and torch.allclose(l0, l1) and 'swap' not in s0['parts']
 
+
+def test_update_app_assign_and_swap_mode_app():
+    """update con app_assign: la apariencia viene de app_assign, la caja y el GRU de assign. run_batch con swap_mode=app: intercambios
+    registrados, pérdida finita y la NLL de movimiento sigue contando todos los tracks presentes (no se marcan como contaminados)."""
+    from tracking.e2e.train import run_batch
+    m = _model()
+    B, K = 1, 4
+    dets = _dets(B, K)
+    enc = m.encode(dets.emb)[1]
+    st = m.new_state(B, 'cpu')
+    st, _ = st.spawn(0, torch.tensor([0, 1]), m.init_state_vec(dets.emb[0, :2]), dets.box[0, :2], torch.tensor(1))
+    assign = torch.full((B, st.alive.shape[1]), K, dtype=torch.long); assign[0, 0], assign[0, 1] = 0, 1
+    app = assign.clone(); app[0, 0], app[0, 1] = 1, 0
+    frame = torch.tensor([2])
+    ref, _ = m.update(st, assign, dets, enc, frame)
+    sw, _ = m.update(st, assign, dets, enc, frame, app_assign=app)
+    crossed, _ = m.update(st, app, dets, enc, frame)
+    assert torch.equal(sw.box, ref.box) and torch.allclose(sw.m, ref.m), 'caja y GRU con la detección propia'
+    assert torch.allclose(sw.a, crossed.a) and not torch.allclose(sw.a, ref.a), 'apariencia con la del vecino'
+
+    B, T, K, P = 2, 6, 6, 4
+    g = torch.Generator().manual_seed(0)
+    base = torch.rand(B, 1, P, 4, generator=g) * 0.1 + torch.tensor([0.3, 0.3, 0.1, 0.2])
+    base[..., 0] += torch.arange(P) * 0.04
+    boxes = torch.cat([base.expand(B, T, P, 4) + 0.01 * torch.randn(B, T, P, 4, generator=g), torch.rand(B, T, K - P, 4, generator=g) * 0.1 + 0.6], 2)
+    tid = torch.cat([torch.arange(P).expand(B, T, P), -torch.ones(B, T, K - P, dtype=torch.long)], 2)
+    batch = dict(emb=torch.randn(B, T, K, D, generator=g), boxes=boxes, scores=torch.rand(B, T, K, generator=g), tid=tid,
+                 frames=torch.arange(1, T + 1).expand(B, T), cross=[None] * B)
+    m_all = _model(train={'p_swap': 1.0, 'p_fn': 0.0}).train()
+    m_app = _model(train={'p_swap': 1.0, 'p_fn': 0.0, 'swap_mode': 'app'}).train()
+    torch.manual_seed(0); _, s_all = run_batch(m_all, batch, m_all.cfg, 'cpu', True, 0.0)
+    torch.manual_seed(0); loss, s_app = run_batch(m_app, batch, m_app.cfg, 'cpu', True, 0.0)
+    assert torch.isfinite(loss) and s_app['swapped'] > 0, s_app
+    assert s_app['n_motion'] > s_all['n_motion'], 'con swap_mode=app la NLL de movimiento no ignora los tracks intercambiados'
+    loss.backward()
+    try:
+        bad = _model(train={'p_swap': 0.1, 'swap_mode': 'box'}).train()
+        run_batch(bad, batch, bad.cfg, 'cpu', True, 0.0)
+        assert False, 'swap_mode desconocido debe fallar'
+    except ValueError:
+        pass
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     for t in tests:
