@@ -89,16 +89,25 @@ En H1/H2 el historial es el estado recurrente del track, así que lo que se corr
 ```bash
 # entrena y evalúa solo h2_swapapp con el mismo detector y receta que H2; la tabla incluye las variantes ya evaluadas.
 # --export solo con las variables (sin ALL): con --export=ALL el trabajo hereda el entorno del login y falla al cargar los módulos (nvcc)
-sbatch --export='E2E_RUN_VARIANTS=h2_swapapp,E2E_TABLE_VARIANTS=h1 h2 h3 h2_swap h2_swapapp' slurm/e2e.slurm
+sbatch --gres=gpu:a30:4 --export='E2E_RUN_VARIANTS=h2_swapapp,E2E_TABLE_VARIANTS=h1 h2 h3 h2_swapapp' slurm/e2e.slurm   # mismas GPUs que H2 (4)
 ```
-**Resultado de `h2_swap`** (val, una semilla, global): HOTA 48.8, AssA 31.6, IDF1 46.2, IDSW 3675, frente a H2 con 58.6, 44.7, 59.9 y 2001.
-El DetA apenas cambia (75.7 frente a 77.2), y OC-SORT y ByteTrack dan lo mismo sobre su detector: lo que empeora es la asociación.
-Hipótesis: en MOTIP2 un intercambio es un token equivocado entre ~30 del historial, mientras que aquí sustituye la caja entera del estado
-(la mejor señal) y el GRU registra un salto falso. Además, con `swap` entre 0.04 y 0.17 por frame, cerca de la mitad de los tracks de un
-clip de 10 frames se corrompen alguna vez, muy lejos de la tasa de robos del tracker en inferencia (~1 %).
+**`h2_swap` y `h2_swapapp` (primer intento): NO VÁLIDOS.** Corrieron con 1 GPU (H2 con 4): con 1000 clips por época son 1000 pasos,
+la congelación del detector (1000 pasos) termina dentro de la época 0, en la época 1 el DetA cae más de la tolerancia (79.6 → 78.9 / 78.2)
+y el trabajo para con la época 0 como mejor (detector sin tocar, módulo con ~1000 clips). Sus HOTA (48.8 y 46.7, frente a 58.6 de H2) no
+dicen nada del aumento. **Compara solo con el mismo número de GPUs** (`world` en `args.json`, "GPU(s)" en el log del trabajo).
 - **`train.swap_mode=app`** (variante `h2_swapapp`, `p_swap` 0.05): el vecino solo entra en la EMA de apariencia (`model.update(...,
   app_assign=...)`); la caja y el GRU se actualizan con la detección propia y la NLL de movimiento no ignora esos tracks. Es el robo que
   deja un cruce en la apariencia, sin tocar la geometría. `swap_mode=all` (por defecto) es el comportamiento de `h2_swap`.
+
+### H2 con entrenamiento largo (variante `h2_long`)
+H2 paró en la época 8 por el DetA con `val_acc` todavía subiendo (0.851 → 0.857), tras ~9000 clips de 10 frames. `h2_long` es H2 con
+clips de `train.T=20` (con stride ≤ 3, hasta ~3 s de vídeo) y se lanza con más clips por época y más tolerancia en el control del DetA:
+```bash
+sbatch --gres=gpu:a30:4 --export='E2E_RUN_VARIANTS=h2_long,E2E_TABLE_VARIANTS=h1 h2 h2_long,JOINT_ARGS=--epochs 40 --samples-per-epoch 4000 --train-backbone --train-encoder --deta-tol 1.0' slurm/e2e.slurm
+```
+- 4000 clips por época con 4 GPUs son 1000 pasos: la congelación del detector (1000 pasos) dura la época 0 y el DetA se mide cada 1000 pasos de lote 4.
+- Cada paso pasa B × 20 frames por el detector con gradiente: el doble de memoria y de tiempo por paso que H2 (sin medir; si da OOM, `train.T=16`).
+- `--deta-tol 1.0` (antes 0.5) deja que el detector se adapte más antes de parar; el DetA de cada época queda en el log.
 
 ## Hito H3: asociación relacional (`tracking/e2e/h3/`, `h3.enabled=true`)
 Módulo alternativo que **sustituye** al `E2EModel` (H1/H2) con la misma tubería (clips, caché, entrenamiento congelado y descongelado con DDP, inferencia, barrido de umbrales, evaluación): `build_model(cfg)` elige el modelo.
